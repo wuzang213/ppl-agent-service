@@ -1,0 +1,10 @@
+.venv/
+.idea/
+.langgraph_api/
+__pycache__/
+*.pyc
+*.db
+app/static/
+db/
+test/
+.env

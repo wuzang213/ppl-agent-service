@@ -1,0 +1,7 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+        "ppl_agent": "./app/agents/hmdp_agent.py:agent"
+    },
+    "env": ".env"
+}
