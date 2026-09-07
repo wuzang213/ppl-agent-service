@@ -58,6 +58,44 @@ def record_tool_call(tool_name: str) -> None:
         data["tools_called"].append(tool_name)
 
 
+def record_node(node_name: str) -> None:
+    """记录本轮经过的节点 / worker，复用 tools_called 字段（节点编排后不再有工具循环）。"""
+    record_tool_call(node_name)
+
+
+def record_model_call(node_name: str = "") -> None:
+    """记录一次模型调用。节点可能运行在子任务里，取不到上下文时静默跳过。"""
+    data = _metrics.get()
+    if data is None:
+        return
+    data["model_call_count"] += 1
+    if node_name and node_name not in data["tools_called"]:
+        data["tools_called"].append(node_name)
+
+
+def record_usage(prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
+    data = _metrics.get()
+    if data is None:
+        return
+    data["prompt_tokens"] += int(prompt_tokens or 0)
+    data["completion_tokens"] += int(completion_tokens or 0)
+    data["total_tokens"] += int(prompt_tokens or 0) + int(completion_tokens or 0)
+
+
+def record_usage_from_message(message: Any) -> None:
+    """从模型返回的消息里抽取 token 用量，抽不到就忽略。"""
+    usage = getattr(message, "usage_metadata", None) or {}
+    if not usage and hasattr(message, "response_metadata"):
+        meta = getattr(message, "response_metadata", {}) or {}
+        usage = meta.get("token_usage") or meta.get("usage") or {}
+    if not usage:
+        return
+    record_usage(
+        usage.get("input_tokens", usage.get("prompt_tokens", 0)),
+        usage.get("output_tokens", usage.get("completion_tokens", 0)),
+    )
+
+
 def _collect_usage(response: ModelResponse) -> None:
     data = _ensure_metrics()
     for message in response.result or []:

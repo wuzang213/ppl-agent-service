@@ -13,8 +13,8 @@ RAG_MQ_SYNC = os.getenv("RAG_MQ_SYNC", "true").lower() == "true"
 EXCHANGE = os.getenv("RABBITMQ_CACHE_SYNC_EXCHANGE", "cache.sync.fanout")
 QUEUE = os.getenv("RAG_SYNC_QUEUE", "agent.rag.sync.queue")
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST")
-RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT"))
-RABBITMQ_USER = os.getenv("RABBITMQ_USER",)
+RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
+RABBITMQ_USER = os.getenv("RABBITMQ_USER")
 RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD")
 RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST")
 

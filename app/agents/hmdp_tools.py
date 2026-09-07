@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from langchain.tools import tool
 
 from app.common.logger import logger
+from app.service_discovery import resolve as resolve_service_url
 from app.agents.hmdp_metrics import record_tool_call
 from app.rag.hmdp_rag import retrieve_shop_rag_chunks
 
@@ -52,14 +53,15 @@ def _request_json(
     base_url: str,
     path: str,
     params: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> ApiResponse:
     if not base_url:
         return ApiResponse(success=False, errorMsg="Java 服务地址未配置，请检查 .env")
 
     headers = {"Accept": "application/json"}
-    user_id = _current_user_id.get()
-    if user_id:
-        headers["user-info"] = str(user_id)
+    uid = user_id if user_id is not None else _current_user_id.get()
+    if uid:
+        headers["user-info"] = str(uid)
 
     try:
         with httpx.Client(base_url=base_url, timeout=5.0, headers=headers) as client:
@@ -84,8 +86,8 @@ def _unwrap(payload: ApiResponse | dict[str, Any]) -> Any:
     return payload
 
 
-def _load_shop_types() -> Any:
-    return _unwrap(_request_json(SHOP_SERVICE_URL, "/shop-type/list"))
+def _load_shop_types(user_id: str = "") -> Any:
+    return _unwrap(_request_json(resolve_service_url("shop"), "/shop-type/list", user_id=user_id))
 
 
 def _compact_shops(shops: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -189,7 +191,7 @@ def get_shops_by_name(name: str, page: int = 1) -> str:
 def get_shop_detail(shop_id: int) -> str:
     """查询单个店铺的详细信息，shop_id 为店铺 id。"""
     record_tool_call("get_shop_detail")
-    data = _unwrap(_request_json(SHOP_SERVICE_URL, f"/shop/{shop_id}"))
+    data = _unwrap(_request_json(resolve_service_url("shop"), f"/shop/{shop_id}"))
     if isinstance(data, str):
         return data
     if not data:
@@ -231,7 +233,7 @@ def get_shop_blogs(shop_id: int, page: int = 1) -> str:
 def get_blog_detail(blog_id: int) -> str:
     """查询单篇博客攻略的完整内容，blog_id 为博客 id。"""
     record_tool_call("get_blog_detail")
-    data = _unwrap(_request_json(BLOG_SERVICE_URL, f"/blog/{blog_id}"))
+    data = _unwrap(_request_json(resolve_service_url("blog"), f"/blog/{blog_id}"))
     if isinstance(data, str):
         return data
     if not data:
@@ -256,7 +258,7 @@ def get_blog_detail(blog_id: int) -> str:
 def get_hot_blogs(page: int = 1) -> str:
     """获取当前热门探店博客列表。"""
     record_tool_call("get_hot_blogs")
-    payload = _request_json(BLOG_SERVICE_URL, "/blog/hot", {"current": page})
+    payload = _request_json(resolve_service_url("blog"), "/blog/hot", {"current": page})
     blogs = _unwrap(payload)
     if isinstance(blogs, str):
         return blogs
@@ -269,7 +271,7 @@ def get_hot_blogs(page: int = 1) -> str:
 def get_shop_vouchers(shop_id: int) -> str:
     """查询店铺当前可用的优惠券，shop_id 为店铺 id。"""
     record_tool_call("get_shop_vouchers")
-    payload = _request_json(VOUCHER_SERVICE_URL, f"/voucher/list/{shop_id}")
+    payload = _request_json(resolve_service_url("voucher"), f"/voucher/list/{shop_id}")
     vouchers = _unwrap(payload)
     if isinstance(vouchers, str):
         return vouchers
@@ -337,6 +339,178 @@ def get_shops_rag_context(shop_ids: list[int], query: str, top_k: int = 3) -> st
         seen.add(sid)
         parts.append(_format_rag_context(sid, query, top_k))
     return "\n\n".join(parts)
+# ---------------------------------------------------------------------------
+# 数据服务层：供 LangGraph 各 Worker 节点直接调用
+# 与上面的 @tool 版本的区别是参数显式传入，不依赖 ContextVar（并行 worker 下 ContextVar 不可靠）
+# 返回值约定：成功返回 list / dict，失败或查不到返回 str（错误或空结果描述）
+# ---------------------------------------------------------------------------
+
+
+def fetch_shop_types(user_id: str = "") -> list[dict[str, Any]] | str:
+    """获取全部店铺类型。"""
+    record_tool_call("fetch_shop_types")
+    data = _load_shop_types(user_id)
+    if isinstance(data, str):
+        return data
+    if not data:
+        return "暂无可用的店铺类型"
+    return [
+        {"id": t.get("id"), "name": t.get("name"), "icon": t.get("icon")}
+        for t in data
+    ]
+
+
+def fetch_shops_nearby(
+    type_name: str,
+    x: float | None,
+    y: float | None,
+    page: int = 1,
+    user_id: str = "",
+) -> list[dict[str, Any]] | str:
+    """按类型查询附近店铺。"""
+    record_tool_call("fetch_shops_nearby")
+    px = x if x is not None else DEFAULT_X
+    py = y if y is not None else DEFAULT_Y
+
+    type_data = _load_shop_types(user_id)
+    if isinstance(type_data, str):
+        return type_data
+    matched = next(
+        (t for t in type_data or [] if type_name and type_name in str(t.get("name") or "")),
+        None,
+    )
+    if matched is None:
+        return f"没有找到类型「{type_name}」"
+
+    dis = int(os.getenv("DEFAULT_SEARCH_RADIUS", "50000"))
+    payload = _request_json(
+        SHOP_SERVICE_URL,
+        "/shop/of/type",
+        {"typeId": matched.get("id"), "current": page, "x": px, "y": py, "distance": dis},
+        user_id=user_id,
+    )
+    shops = _unwrap(payload)
+    if isinstance(shops, str):
+        return shops
+    if not shops:
+        return f"第 {page} 页没有「{type_name}」类型的店铺"
+    return _compact_shops(shops)
+
+
+def fetch_shops_by_name(
+    name: str, page: int = 1, user_id: str = ""
+) -> list[dict[str, Any]] | str:
+    """按店铺名称关键字搜索。"""
+    record_tool_call("fetch_shops_by_name")
+    payload = _request_json(
+        SHOP_SERVICE_URL, "/shop/of/name", {"name": name, "current": page}, user_id=user_id
+    )
+    shops = _unwrap(payload)
+    if isinstance(shops, str):
+        return shops
+    if not shops:
+        return f"没有找到名称包含「{name}」的店铺"
+    return _compact_shops(shops)
+
+
+def fetch_shop_detail(shop_id: int, user_id: str = "") -> dict[str, Any] | str:
+    """查询单个店铺详情。"""
+    record_tool_call("fetch_shop_detail")
+    data = _unwrap(
+        _request_json(resolve_service_url("shop"), f"/shop/{shop_id}", user_id=user_id)
+    )
+    if isinstance(data, str):
+        return data
+    if not data:
+        return f"店铺 {shop_id} 不存在"
+    return {
+        "id": data.get("id"),
+        "name": data.get("name"),
+        "address": data.get("address"),
+        "area": data.get("area"),
+        "avgPrice": data.get("avgPrice"),
+        "score": data.get("score"),
+        "sold": data.get("sold"),
+        "openHours": data.get("openHours"),
+        "distance": data.get("distance"),
+    }
+
+
+def fetch_shop_blogs(
+    shop_id: int, page: int = 1, user_id: str = ""
+) -> list[dict[str, Any]] | str:
+    """查询某店铺下的探店博客。"""
+    record_tool_call("fetch_shop_blogs")
+    payload = _request_json(
+        BLOG_SERVICE_URL, f"/blog/of/shop/{shop_id}", {"current": page}, user_id=user_id
+    )
+    blogs = _unwrap(payload)
+    if isinstance(blogs, str):
+        return blogs
+    if not blogs:
+        return f"店铺 {shop_id} 暂时没有博客攻略"
+    return _compact_blogs(blogs)
+
+
+def fetch_shop_vouchers(shop_id: int, user_id: str = "") -> list[dict[str, Any]] | str:
+    """查询店铺可用优惠券。"""
+    record_tool_call("fetch_shop_vouchers")
+    payload = _request_json(
+        VOUCHER_SERVICE_URL, f"/voucher/list/{shop_id}", user_id=user_id
+    )
+    vouchers = _unwrap(payload)
+    if isinstance(vouchers, str):
+        return vouchers
+    if not vouchers:
+        return f"店铺 {shop_id} 暂时没有优惠券"
+    return [
+        {
+            "id": v.get("id"),
+            "title": v.get("title"),
+            "subTitle": v.get("subTitle"),
+            "rules": v.get("rules"),
+            "payValue": v.get("payValue"),
+            "actualValue": v.get("actualValue"),
+            "type": v.get("type"),
+            "stock": v.get("stock"),
+            "beginTime": v.get("beginTime"),
+            "endTime": v.get("endTime"),
+        }
+        for v in vouchers
+    ]
+
+
+def fetch_rag_chunks(
+    shop_id: int, query: str, top_k: int = 3
+) -> list[dict[str, Any]] | str:
+    """检索某店铺博客中与 query 相关的片段。"""
+    record_tool_call("fetch_rag_chunks")
+    top_k = min(max(top_k, 1), 5)
+    try:
+        chunks = retrieve_shop_rag_chunks(int(shop_id), query, top_k)
+    except Exception as exc:  # RAG 索引未就绪时不能让整个流程崩掉
+        logger.error(f"RAG 检索失败 shop_id={shop_id}: {exc}")
+        return f"店铺 {shop_id} 的细节检索暂时不可用"
+    if not chunks:
+        return f"店铺 {shop_id}：根据现有博客暂未查到与「{query}」相关的内容"
+    result = []
+    for chunk in chunks:
+        meta = chunk.get("metadata") or {}
+        content = (chunk.get("content") or "").strip()
+        if not content:
+            continue
+        result.append(
+            {
+                "title": meta.get("title") or "未知标题",
+                "author": meta.get("author") or "",
+                "content": content[:300],
+            }
+        )
+    if not result:
+        return f"店铺 {shop_id}：根据现有博客暂未查到与「{query}」相关的内容"
+    return result
+
+
 TOOLS = [
     get_shop_types,
     get_shops_nearby,
@@ -350,4 +524,15 @@ TOOLS = [
     get_shops_rag_context,
 ]
 
-__all__ = ["TOOLS", "set_user_context", "reset_user_context"]
+__all__ = [
+    "TOOLS",
+    "set_user_context",
+    "reset_user_context",
+    "fetch_shop_types",
+    "fetch_shops_nearby",
+    "fetch_shops_by_name",
+    "fetch_shop_detail",
+    "fetch_shop_blogs",
+    "fetch_shop_vouchers",
+    "fetch_rag_chunks",
+]

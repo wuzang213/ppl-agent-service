@@ -12,6 +12,7 @@ from app.rag.hmdp_mq_sync import start_rag_sync_consumer
 from app.api.v1 import hmdp, oss, sessions
 from app.common.logger import setup_logging
 from app.nacos_registry import deregister_from_nacos, register_to_nacos
+from app.service_discovery import start_discovery, stop_discovery
 
 setup_logging()
 
@@ -20,6 +21,7 @@ setup_logging()
 async def lifespan(app: FastAPI):
     await hmdp_agent.init()
     await register_to_nacos()
+    start_discovery()
     rag_consumer_task = asyncio.create_task(start_rag_sync_consumer())
     yield
     rag_consumer_task.cancel()
@@ -27,6 +29,7 @@ async def lifespan(app: FastAPI):
         await rag_consumer_task
     except asyncio.CancelledError:
         pass
+    stop_discovery()
     await deregister_from_nacos()
     await hmdp_agent.close()
 
