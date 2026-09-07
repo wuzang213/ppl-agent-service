@@ -26,12 +26,30 @@ Python、FastAPI、LangChain、LangGraph、Chroma、BM25、RRF、Cross-Encoder�
 
 ## Agent 架构
 
+```mermaid
+flowchart TD
+    S([START]) --> T["trim_history<br/>超阈值时压缩早期消息"]
+    T --> R["entry_router<br/>意图识别与实体抽取"]
+    R -->|daily| D["daily_chat<br/>闲聊流式直出"]
+    R -->|recommend| G["grounding<br/>规则解析 shop_ids"]
+    G -->|有 shop_id| W["shop_worker × N<br/>Send 并行取数"]
+    G -->|无 shop_id| N["nearby_worker<br/>定位取候选"]
+    G -->|无法解析| C["clarify<br/>信息不足时追问"]
+    N --> W
+    W --> Z["summarize<br/>主模型汇总输出"]
+    D --> E([END])
+    C --> E
+    Z --> E
+
+    classDef llm fill:#E6F1FB,stroke:#185FA5,color:#042C53
+    classDef data fill:#EEEDFE,stroke:#534AB7,color:#26215C
+    classDef plain fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+    class T,R,D,Z llm
+    class G,W,N data
+    class C plain
 ```
-START → trim_history → entry_router ─┬─ daily     → daily_chat → END
-                                     └─ recommend → grounding ─┬─ 有 shop_id → dispatch_workers → shop_worker ×N → summarize → END
-                                                               ├─ 无 shop_id → nearby_worker → 按需扇出 → summarize → END
-                                                               └─ 无法解析   → clarify → END
-```
+
+蓝色为调用大模型的节点，紫色为纯取数节点。
 
 | 节点 | 作用 | 是否调 LLM |
 |---|---|---|
