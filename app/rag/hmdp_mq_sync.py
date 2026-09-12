@@ -1,8 +1,10 @@
 """监听 Canal 的缓存同步 fanout 交换机，增量更新 RAG 索引。"""
 
 import asyncio
+import hashlib
 import json
 import os
+from collections import OrderedDict
 
 import aio_pika
 
@@ -12,11 +14,16 @@ from app.rag.hmdp_rag import sync_blog_by_id
 RAG_MQ_SYNC = os.getenv("RAG_MQ_SYNC", "true").lower() == "true"
 EXCHANGE = os.getenv("RABBITMQ_CACHE_SYNC_EXCHANGE", "cache.sync.fanout")
 QUEUE = os.getenv("RAG_SYNC_QUEUE", "agent.rag.sync.queue")
-RABBITMQ_HOST = os.getenv("RABBITMQ_HOST")
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST")  # 由 .env 注入，不写死默认值
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
-RABBITMQ_USER = os.getenv("RABBITMQ_USER")
-RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD")
-RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST")
+RABBITMQ_USER = os.getenv("RABBITMQ_USER")  # 由 .env 注入，不写死默认值
+RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD")  # 由 .env 注入，不写死默认值
+RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/hm-dianping")
+
+# 限制重试次数，超过 3 次后 reject(requeue=False) 进死信
+_RETRY_LIMIT = 3
+_RETRY_CACHE_MAX = 1000
+_retry_counts: "OrderedDict[str, int]" = OrderedDict()
 
 
 async def _on_message(message: aio_pika.abc.AbstractIncomingMessage) -> None:
@@ -27,8 +34,25 @@ async def _on_message(message: aio_pika.abc.AbstractIncomingMessage) -> None:
             logger.info("RAG 增量同步完成: %s", result)
         await message.ack()
     except Exception as exc:
-        logger.error("RAG 增量同步失败，重新入队: %s", exc)
-        await message.reject(requeue=True)
+        # 记录重试次数，超过 3 次后拒绝重入队（避免无限 requeue 打满 CPU）
+        body_key = hashlib.md5(message.body).hexdigest()[:16]
+        count = _retry_counts.get(body_key, 0) + 1
+        _retry_counts[body_key] = count
+        while len(_retry_counts) > _RETRY_CACHE_MAX:
+            _retry_counts.popitem(last=False)
+        if count > _RETRY_LIMIT:
+            logger.error(
+                "RAG 增量同步重试 %d 次耗尽，拒绝重入队 body_key=%s: %s",
+                count, body_key, exc,
+            )
+            _retry_counts.pop(body_key, None)
+            await message.reject(requeue=False)
+        else:
+            logger.warning(
+                "RAG 增量同步第 %d 次重试 body_key=%s: %s",
+                count, body_key, exc,
+            )
+            await message.reject(requeue=True)
 
 
 async def _consume_forever() -> None:
