@@ -7,11 +7,10 @@ import json
 import os
 from typing import Any
 
-import aiosqlite
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from app.agents.checkpoint import create_checkpointer
 from app.agents.graph import build_graph
 from app.agents.graph.llm import get_light_model, get_main_model
 from app.agents.graph.nodes import as_text
@@ -49,8 +48,8 @@ _NODE_STATUS = {
 class HmdpAgent:
 
     def __init__(self) -> None:
-        self.conn: aiosqlite.Connection | None = None
-        self.checkpointer: AsyncSqliteSaver | None = None
+        self.checkpointer: Any | None = None
+        self._checkpointer_close: Any | None = None
         self.graph = None
 
     async def init(self) -> None:
@@ -62,14 +61,17 @@ class HmdpAgent:
         logger.info("hmdp agent 初始化完成（LangGraph 节点编排）")
 
     async def _init_checkpointer(self) -> None:
-        os.makedirs("db", exist_ok=True)
-        self.conn = await aiosqlite.connect("db/hmdp_agent.db")
-        self.checkpointer = AsyncSqliteSaver(conn=self.conn)
-        await self.checkpointer.setup()
+        """按 AGENT_CHECKPOINT_BACKEND 构造 checkpoint 后端（默认 redis）。
+
+        原来是本地 sqlite（db/hmdp_agent.db）—— 那是进程内的本地文件，
+        多实例部署时同一个 thread_id 打到不同实例会读不到历史，容器重建即丢。
+        """
+        self.checkpointer, self._checkpointer_close = await create_checkpointer()
 
     async def close(self) -> None:
-        if self.conn is not None:
-            await self.conn.close()
+        if self._checkpointer_close is not None:
+            await self._checkpointer_close()
+            self._checkpointer_close = None
         logger.info("hmdp agent 连接已关闭")
 
     # ------------------------------------------------------------------

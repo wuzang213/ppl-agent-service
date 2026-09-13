@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sse_starlette import EventSourceResponse
 
 from app.agents.hmdp_agent import hmdp_agent
-from app.models.session import get_sessions
+from app.models.session import get_session
 from app.rag.hmdp_rag import get_index_stats, rebuild_blog_index
 
 router = APIRouter()
@@ -28,14 +28,18 @@ def _resolve_thread_id(thread_id: str, user_id: str) -> str:
     """前端未持久化 thread_id 时，用用户维度生成默认会话。"""
     return thread_id or f"user:{user_id or 'anonymous'}"
 
-def _ensure_thread_owned(thread_id: str, user_id: str) -> str:
+async def _ensure_thread_owned(thread_id: str, user_id: str) -> str:
     if not thread_id:
         return _resolve_thread_id(thread_id, user_id)
     resolved = _resolve_thread_id(thread_id, user_id)
     if user_id and thread_id.startswith(f"user:{user_id}"):
         return resolved
-    if user_id and not any(s.thread_id == thread_id for s in get_sessions(user_id=user_id)):
-        raise HTTPException(status_code=403, detail="无权访问该会话")
+    if user_id:
+        # 会话元数据已搬到 MySQL，查询是异步的（原 SQLite 是同步直连）；
+        # 用主键查单条，避免"列出该用户全部会话来比对"
+        session = await get_session(thread_id)
+        if session is None or session.user_id != user_id:
+            raise HTTPException(status_code=403, detail="无权访问该会话")
     return resolved
 
 
@@ -86,7 +90,7 @@ async def chat_messages(
     user_info: Optional[str] = Header(default=None, alias="user-info"),
 ):
     uid = user_info or user_id
-    resolved = _ensure_thread_owned(thread_id, uid)
+    resolved = await _ensure_thread_owned(thread_id, uid)
     return await hmdp_agent.get_messages(resolved)
 
 
@@ -97,7 +101,7 @@ async def chat_clear_messages(
     user_info: Optional[str] = Header(default=None, alias="user-info"),
 ):
     uid = user_info or user_id
-    resolved = _ensure_thread_owned(thread_id, uid)
+    resolved = await _ensure_thread_owned(thread_id, uid)
     await hmdp_agent.clear_messages(resolved)
     return {"success": True}
 

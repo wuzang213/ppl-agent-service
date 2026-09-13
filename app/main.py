@@ -11,6 +11,8 @@ from app.agents.hmdp_agent import hmdp_agent
 from app.rag.hmdp_mq_sync import start_rag_sync_consumer
 from app.api.v1 import hmdp, oss, sessions
 from app.common.logger import setup_logging
+from app.common.mysql import close_mysql_pool, init_mysql_pool
+from app.models.session import ensure_session_table
 from app.nacos_registry import deregister_from_nacos, register_to_nacos
 from app.service_discovery import start_discovery, stop_discovery
 
@@ -19,6 +21,9 @@ setup_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 会话元数据存 MySQL（原来是本地 SQLite）：先建池再建表，失败即启动失败（fail fast）
+    await init_mysql_pool()
+    await ensure_session_table()
     await hmdp_agent.init()
     await register_to_nacos()
     start_discovery()
@@ -32,6 +37,7 @@ async def lifespan(app: FastAPI):
     stop_discovery()
     await deregister_from_nacos()
     await hmdp_agent.close()
+    await close_mysql_pool()
 
 
 app = FastAPI(

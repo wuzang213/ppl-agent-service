@@ -43,7 +43,11 @@ def rerank_chunks(query: str, chunks: list[dict[str, Any]], top_k: int) -> list[
             key=lambda item: float(item[1]),
             reverse=True,
         )
-        positive = [chunk for chunk, score in ranked if float(score) > 0]
+        # 用相对阈值（score >= max_score * 0.5）替代硬阈值 score > 0
+        # 硬阈值 score > 0 会丢掉所有负分但相关的结果；相对阈值保留与最高分相近的结果
+        max_score = float(ranked[0][1]) if ranked else 0.0
+        threshold = max_score * 0.5
+        positive = [chunk for chunk, score in ranked if float(score) >= threshold]
         return (positive or [chunk for chunk, _ in ranked])[:top_k]
     except Exception as exc:
         logger.error("Rerank 执行失败，回退 RRF 排序: %s", exc)
