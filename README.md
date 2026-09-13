@@ -8,7 +8,7 @@ Agent 采用**多节点图编排**而非单模型全流程：入口用轻量模�
 
 ## 技术栈
 
-Python、FastAPI、LangChain、LangGraph、Chroma、BM25、RRF、Cross-Encoder、RabbitMQ、Nacos、SSE
+Python、FastAPI、LangChain、LangGraph、Chroma、BM25、RRF、Cross-Encoder、RabbitMQ、Nacos、SSE（checkpoint 默认 Redis，会话元数据存 MySQL）
 
 ## 核心功能
 
