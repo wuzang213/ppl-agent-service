@@ -1,11 +1,12 @@
 """评评哩本地生活 Agent —— 基于 LangGraph 节点编排。
 
-对外接口（generate_sse / get_messages / clear_messages）与改造前完全一致，
+对外接口（generate_sse / get_messages / clear_messages）。
+
 """
 
 import json
 import os
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
@@ -21,6 +22,14 @@ from app.agents.hmdp_metrics import (
 )
 from app.agents.hmdp_tools import reset_user_context, set_user_context
 from app.common.logger import logger
+from app.models.message import (
+    ROLE_ASSISTANT,
+    ROLE_USER,
+    append_message,
+    count_messages,
+    delete_messages,
+    list_messages,
+)
 
 load_dotenv()
 
@@ -83,6 +92,17 @@ class HmdpAgent:
             "data": json.dumps(payload, ensure_ascii=False, default=str),
         }
 
+    async def _safe_append(self, thread_id: str, role: str, content: str, user_id: str = "") -> None:
+        """往 append-only 消息表追加一条，失败只记日志。
+
+        刻意不让它抛异常：这是"给用户看的历史"的旁路记录，写库失败不应该
+        把整轮对话搞挂（对话本身已经通过 SSE 返回给用户了）。
+        """
+        try:
+            await append_message(thread_id, role, content, user_id)
+        except Exception as exc:
+            logger.error("写入会话消息失败 thread_id=%s role=%s: %s", thread_id, role, exc)
+
     async def generate_sse(
         self,
         thread_id: str,
@@ -96,6 +116,9 @@ class HmdpAgent:
         tokens = set_user_context(user_id, x, y)
         metrics_token = begin_metrics(thread_id, user_id, mode)
         config = {"configurable": {"thread_id": thread_id}}
+
+        # 用户消息先落 append-only 表：即使本轮模型失败，用户问过什么也应留在历史里
+        await self._safe_append(thread_id, ROLE_USER, message, user_id)
 
         if interrupt_decision:
             logger.warning("节点编排版已移除 interrupt 流程，interrupt_decision 参数被忽略")
@@ -172,13 +195,49 @@ class HmdpAgent:
             yield self._sse("error", {"type": "error", "error": str(exc)})
         finally:
             reset_user_context(tokens)
+            # 记录助手回复：含异常/客户端断开时已生成的部分，保证"用户看到的"与"存下来的"一致
+            recorded = final_answer or "".join(full_parts).strip()
+            if recorded:
+                await self._safe_append(thread_id, ROLE_ASSISTANT, recorded, user_id)
             metrics = finish_metrics(metrics_token, success=success, error=error)
             await save_metrics(metrics)
 
     # ------------------------------------------------------------------
     # 会话
     # ------------------------------------------------------------------
-    async def get_messages(self, thread_id: str) -> dict[str, Any]:
+    async def get_messages(
+        self, thread_id: str, limit: Optional[int] = None, offset: int = 0
+    ) -> dict[str, Any]:
+        """返回会话的完整聊天记录（展示用）。
+
+        数据源是 append-only 的 `agent_message` 表，**不是** checkpoint 里那份会被压缩的
+        `messages` —— 这样才能做到"历史压缩只影响喂给模型的上下文"，用户刷新后记录依然完整。
+
+        老会话（迁表之前创建、表里还没有记录）回退到读 checkpoint，保持向后兼容。
+
+        分页：`limit` 省略即返回全部；`offset` 是"从最新往老"跳过的条数。
+        """
+        total = 0
+        try:
+            total = await count_messages(thread_id)
+        except Exception as exc:
+            logger.error("查询会话消息数失败，回退 checkpoint thread_id=%s: %s", thread_id, exc)
+
+        if total:
+            try:
+                messages = await list_messages(thread_id, limit=limit, offset=offset)
+                payload: dict[str, Any] = {"messages": messages, "total": total}
+                if limit is not None:
+                    payload["has_more"] = (max(0, offset) + len(messages)) < total
+                return payload
+            except Exception as exc:
+                logger.error("读取会话消息失败，回退 checkpoint thread_id=%s: %s", thread_id, exc)
+
+        # 回退：老会话只能读 checkpoint（注意这份是**被压缩过**的窗口）
+        return await self._messages_from_checkpoint(thread_id)
+
+    async def _messages_from_checkpoint(self, thread_id: str) -> dict[str, Any]:
+        """从 checkpoint 的 State 里取消息（仅用于老会话的向后兼容）。"""
         state = await self.graph.aget_state({"configurable": {"thread_id": thread_id}})
         if state is None or not state.values:
             return {"messages": []}
@@ -189,13 +248,20 @@ class HmdpAgent:
             if not content:
                 continue
             if isinstance(msg, HumanMessage):
-                result.append({"role": "user", "content": as_text(content)})
+                result.append({"role": ROLE_USER, "content": as_text(content)})
             elif isinstance(msg, AIMessage):
-                result.append({"role": "assistant", "content": as_text(content)})
+                result.append({"role": ROLE_ASSISTANT, "content": as_text(content)})
         return {"messages": result}
 
     async def clear_messages(self, thread_id: str) -> None:
+        """清空会话：checkpoint 与展示用的消息表一起删。"""
         await self.checkpointer.adelete_thread(thread_id)
+        try:
+            removed = await delete_messages(thread_id)
+            if removed:
+                logger.info("已删除会话消息 %s 条 thread_id=%s", removed, thread_id)
+        except Exception as exc:
+            logger.error("删除会话消息失败 thread_id=%s: %s", thread_id, exc)
 
 
 hmdp_agent = HmdpAgent()

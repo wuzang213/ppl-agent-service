@@ -3,7 +3,7 @@
 import asyncio
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel
 from sse_starlette import EventSourceResponse
 
@@ -87,11 +87,17 @@ async def chat_send(
 async def chat_messages(
     thread_id: str = "",
     user_id: str = "",
+    limit: Optional[int] = Query(
+        None, ge=1, le=500,
+        description="最多返回多少条（从最新往前取）；省略则返回全部",
+    ),
+    offset: int = Query(0, ge=0, description="从最新往老跳过的条数，用于翻页"),
     user_info: Optional[str] = Header(default=None, alias="user-info"),
 ):
+    """会话历史。返回 append-only 消息表里的完整记录，不受历史压缩影响。"""
     uid = user_info or user_id
     resolved = await _ensure_thread_owned(thread_id, uid)
-    return await hmdp_agent.get_messages(resolved)
+    return await hmdp_agent.get_messages(resolved, limit=limit, offset=offset)
 
 
 @router.delete("/chat/messages")

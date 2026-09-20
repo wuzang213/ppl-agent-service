@@ -83,12 +83,20 @@ async def remove_session(
 @router.get("/sessions/{thread_id}/messages", tags=["会话"])
 async def get_session_messages(
     thread_id: str,
+    limit: Optional[int] = Query(
+        None, ge=1, le=500,
+        description="最多返回多少条（从最新往前取）；省略则返回全部",
+    ),
+    offset: int = Query(0, ge=0, description="从最新往老跳过的条数，用于翻页"),
     user_info: Optional[str] = Header(default=None, alias="user-info"),
 ):
     """获取会话的历史消息
 
     与 DELETE 同样区分：会话不存在 → 404，不属于当前用户 → 403
     （原实现把两种情况都判成 403，这里一并修正）。
+
+    返回的是 append-only 消息表里的**完整记录**，不受历史压缩影响。
+    `limit`/`offset` 可选；不传时行为与原来完全一致（返回全部）。
     """
     uid = _require_user(user_info)
     session = await get_session(thread_id)
@@ -97,6 +105,6 @@ async def get_session_messages(
     if session.user_id != uid:
         raise HTTPException(status_code=403, detail="无权查看该会话")
     try:
-        return await hmdp_agent.get_messages(thread_id)
+        return await hmdp_agent.get_messages(thread_id, limit=limit, offset=offset)
     except Exception as e:
         return {"messages": [], "error": str(e)}

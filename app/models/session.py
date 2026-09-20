@@ -1,4 +1,23 @@
 """会话元数据的 MySQL 存储。
+
+**原实现**：`sqlite3` 直连本地文件 `db/sessions.db`。多实例部署下实例之间互不可见。
+**现实现**：MySQL 独立库 `hmdp_agent`，表 `sessions`，与 Java 侧共用同一个 MySQL 实例
+（连接池与选型说明见 `app/common/mysql.py` 的模块注释）。
+
+对外接口（`create_session` / `get_sessions` / `delete_session`）的**签名与返回结构都没变**，
+只是从同步改成了 async —— 因为 aiomysql 是协程驱动，阻塞调用会卡住整个事件循环。
+
+## 时间戳口径
+
+`created_at` / `updated_at` 由**应用侧**写入 `datetime.now()`（本地墙钟时间，带微秒），
+DDL 里刻意**不加** `DEFAULT CURRENT_TIMESTAMP` / `ON UPDATE CURRENT_TIMESTAMP`。
+
+原因：MySQL 实例的 `time_zone` 是 `SYSTEM` = **UTC**（实测 `NOW()` 比本地时间少 8 小时），
+一旦用 `CURRENT_TIMESTAMP` 兜底，同一列里会混进 UTC 值；而接口是把列值 `isoformat()` 后
+原样返回给前端的，混了就会让部分会话的显示时间差 8 小时。
+
+保持"应用侧写入本地时间"也和改造前的行为完全一致：原来 `datetime.now().isoformat()` 产出
+`2026-09-13T16:40:27.123456`，现在 `DATETIME(6)` 读回来再 `isoformat()`，字符串一模一样。
 """
 
 import uuid
@@ -40,29 +59,9 @@ class SessionResponse(BaseModel):
     updated_at: str
 
 
-# 建表语句。与 sql/agent_session.sql 一致：
-#   - `datetime(6)` 保留微秒，读回来 isoformat() 的字符串与改造前完全一致
-#   - 刻意不写 DEFAULT CURRENT_TIMESTAMP，见模块注释的「时间戳口径」
-#   - (user_id, biz_type, updated_at) 联合索引覆盖 GET /sessions 的过滤 + 排序
-CREATE_TABLE_SQL = f"""
-CREATE TABLE IF NOT EXISTS `{TABLE_NAME}` (
-    `thread_id`  varchar({THREAD_ID_MAX})  NOT NULL COMMENT '会话ID（uuid4）',
-    `user_id`    varchar({USER_ID_MAX})    NOT NULL COMMENT '归属用户ID，来自 user-info 头',
-    `biz_type`   varchar({BIZ_TYPE_MAX})   NOT NULL COMMENT '业务类型，前端透传',
-    `name`       varchar({NAME_MAX})       NOT NULL COMMENT '会话名称',
-    `created_at` datetime(6)               NOT NULL COMMENT '创建时间（应用侧写入本地墙钟时间，不使用数据库默认值）',
-    `updated_at` datetime(6)               NOT NULL COMMENT '更新时间（应用侧写入本地墙钟时间，不使用数据库默认值）',
-    PRIMARY KEY (`thread_id`),
-    KEY `idx_user_biz_updated` (`user_id`, `biz_type`, `updated_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
-  COMMENT='智能体会话元数据（agent-service）'
-"""
-
-
-async def ensure_session_table() -> None:
-    """建表（幂等）。在应用启动阶段、连接池就绪之后调用。"""
-    async with acquire_cursor(dict_rows=False) as cur:
-        await cur.execute(CREATE_TABLE_SQL)
+# ⚠️ 表结构不在代码里维护：本模块只做数据读写，不建表。
+# DDL 的唯一权威是 sql/agent_session.sql（由部署方执行）；
+# 应用启动时只校验表是否存在（app.common.mysql.verify_tables），缺失即启动失败并提示脚本路径。
 
 
 def _iso(value: object) -> str:

@@ -11,19 +11,24 @@ from app.agents.hmdp_agent import hmdp_agent
 from app.rag.hmdp_mq_sync import start_rag_sync_consumer
 from app.api.v1 import hmdp, oss, sessions
 from app.common.logger import setup_logging
-from app.common.mysql import close_mysql_pool, init_mysql_pool
-from app.models.session import ensure_session_table
+from app.common.mysql import close_mysql_pool, init_mysql_pool, verify_tables
+from app.models.message import TABLE_NAME as MESSAGE_TABLE
+from app.models.session import TABLE_NAME as SESSION_TABLE
 from app.nacos_registry import deregister_from_nacos, register_to_nacos
 from app.service_discovery import start_discovery, stop_discovery
 
 setup_logging()
 
+# 启动时必须存在的表。**代码不建表** —— DDL 由部署方执行 sql/ 下的脚本（见 sql/README.md），
+# 这里只做存在性校验：缺表就 fail fast，避免运行时第一个请求才报错。
+REQUIRED_TABLES = (SESSION_TABLE, MESSAGE_TABLE)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 会话元数据存 MySQL（原来是本地 SQLite）：先建池再建表，失败即启动失败（fail fast）
+    # 建池（含库不存在时的可读报错）→ 校验必需表存在。两步都 fail fast。
     await init_mysql_pool()
-    await ensure_session_table()
+    await verify_tables(REQUIRED_TABLES)
     await hmdp_agent.init()
     await register_to_nacos()
     start_discovery()

@@ -6,6 +6,7 @@
 - 用完即弃的中间结果，必须能从 State 里清掉，否则会被 checkpoint 带进下一轮
 """
 
+import os
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import AnyMessage
@@ -80,6 +81,10 @@ class RoutePlan(BaseModel):
 # 自定义对象会直接抛 TypeError，所以这里不能用 sentinel object。
 CLEAR = "__CLEAR__"
 
+# 跨轮焦点的最大保留家数。焦点是累积的（见 merge_focus），必须设上限，
+# 否则长会话（几十轮）会把焦点列表撑成几十家，既拖慢指代解析、也让兜底渲染变长。
+FOCUS_MAX = int(os.getenv("AGENT_FOCUS_MAX", "10"))
+
 
 def add_and_clear(left: Any, right: Any) -> list[Any]:
     """累积 reducer，遇到 CLEAR 信号时清空。
@@ -94,6 +99,36 @@ def add_and_clear(left: Any, right: Any) -> list[Any]:
     return base + list(right)
 
 
+def merge_focus(left: Any, right: Any) -> list[dict]:
+    """focus_shops 的累积 reducer：按 id 去重后追加，保持出现顺序，超出上限丢最早的。
+
+    为什么必须累积而不能覆盖（原实现是直接覆盖）：
+    用户先分别问「A 店怎么样 / B 店怎么样 / C 店怎么样」，再问「这三家对比如何」时，
+    如果焦点每轮整体覆盖，后一轮会把前几轮的店冲掉；而 A/B/C 分别查询时又走不到
+    nearby 分支（原来只有 nearby 结果才沉淀焦点），于是最后一句指代解析拿不到任何实体，
+    表现为答非所问地反问「你想了解哪家店铺呢」。
+
+    累积后焦点列表的顺序 = 店铺被提及的顺序，因此「第一/第二/第三家」的索引语义
+    反而更符合直觉（依次问 A、B、C 后说「第三家」＝ C）。
+    """
+    base = list(left) if isinstance(left, list) else []
+    if not right or (isinstance(right, str) and right == CLEAR):
+        return base
+    merged: list[dict] = list(base)
+    seen: set[int] = {
+        int(s["id"]) for s in merged if isinstance(s, dict) and s.get("id") is not None
+    }
+    for shop in right:
+        if not isinstance(shop, dict):
+            continue
+        sid = shop.get("id")
+        if sid is None or int(sid) in seen:
+            continue
+        seen.add(int(sid))
+        merged.append(shop)
+    return merged[-FOCUS_MAX:]
+
+
 class HmdpState(TypedDict):
     # ---- 每轮输入（覆盖写入）----
     query: str
@@ -105,8 +140,9 @@ class HmdpState(TypedDict):
     # ---- 第一层：路由结果 ----
     plan: dict | None
 
-    # ---- 第二层：跨轮焦点，用于解析"这家/第二家" ----
-    focus_shops: list[dict]
+    # ---- 第二层：跨轮焦点，用于解析"这家/第二家/这三家" ----
+    # 累积写入（见 merge_focus）：分别问过 A/B/C 后问"这三家对比"，焦点里三家都在。
+    focus_shops: Annotated[list[dict], merge_focus]
     shop_ids: list[int]
 
     # ---- 第三层：worker 扇出参数（由 Send 注入）----

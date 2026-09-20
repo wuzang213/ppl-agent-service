@@ -71,9 +71,31 @@ _LOCAL_KEYWORDS = (
 )
 
 _ORDINAL = {"一": 0, "二": 1, "两": 1, "三": 2, "四": 3, "五": 4, "1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
-_ANAPHORA = re.compile(r"这家|那家|此店|它|它们|这两家|这几家|第二家|第[一二两三四五1-5]家|其中|哪个更好|哪家更")
-# 复数指代：这类说法指向多家店，不能只取焦点里的第一家
-_PLURAL_ANAPHORA = re.compile(r"两[家个]|这几家|这些|它们|都|分别|各自|对比|比较|哪个更好|哪家更")
+# 单数/复数指代都算"用了指代"。注意要能匹配「这三家」——原来只写了「这两家」，
+# 导致「这三家对比如何」连指代分支都进不去，直接跑到兜底追问。
+_ANAPHORA = re.compile(
+    r"这家|那家|此店|它|它们|这[一二两三四五1-5][家个]|这几家|"
+    r"第[一二两三四五1-5][家个]|其中|哪个更好|哪家更"
+)
+# 复数指代：这类说法指向多家店，不能只取焦点里的第一家。
+# ⚠️ 必须排除「第X家」——那是单数指代。否则「第二家」里的「二家」会被当成复数，
+# 走到 focus[:2] 去，把单数问题解析成两家。（用 (?<!第) 负向后顾排除）
+_PLURAL_ANAPHORA = re.compile(
+    r"(?<!第)[这那]?[一二两三四五1-5][家个]|这[几些]家|这些|它们|都|分别|各自|对比|比较|哪个更好|哪家更"
+)
+
+
+def _plural_count(query: str) -> int | None:
+    """从「这三家 / 那两家 / 两家」里抽出用户指代的**店铺数量**（不是索引）。
+
+    `_ORDINAL` 存的是索引（三→2），所以这里要 +1 才是家数。
+    同样排除「第X家」（(?<!第)），避免把「第二家」读成"2 家"。
+    """
+    match = re.search(r"(?<!第)[这那]?([一二两三四五1-5])[家个]", query)
+    if not match:
+        return None
+    idx = _ORDINAL.get(match.group(1))
+    return None if idx is None else idx + 1
 
 
 # ---- 通用小工具 -----------------------------------------------------------
@@ -116,7 +138,12 @@ def _history_before_current(messages: list[Any], turns: int = 2):
 async def trim_history(state: HmdpState) -> dict:
     """控制 messages 长度：超出 HISTORY_KEEP 轮后，把最早的消息用便宜模型压缩成
     一段 running summary 存入 State，再 RemoveMessage 删掉原文。既避免 token 无限膨胀，
-    又尽量不丢上文语义。"""
+    又尽量不丢上文语义。
+
+    ⚠️ 删除原文与摘要生成必须是**原子决策**：只有摘要真正生成出来才删。
+    否则「摘要失败 + 原文照删」会让这段对话永久丢失——首次压缩时连摘要都没有，
+    非首次时旧摘要也补不回这批新内容，而且后者从摘要字段上看不出来（静默丢）。
+    """
     record_node("trim_history")
     messages = state.get("messages") or []
     keep = _history_keep() * 2
@@ -130,10 +157,17 @@ async def trim_history(state: HmdpState) -> dict:
     prev_summary = (state.get("history_summary") or "").strip()
     new_summary = await _summarize_history(prev_summary, outdated)
 
-    update: dict = {"messages": [RemoveMessage(id=m.id) for m in outdated]}
-    if new_summary:
-        update["history_summary"] = new_summary
-    return update
+    if not new_summary:
+        # 摘要没生成出来 → 保留原文，本轮放弃压缩（消息暂时超长），下一轮再试。
+        # 宁可暂时多占点 token，也不能把已经发生过的对话删掉。
+        logger.warning(
+            "历史压缩未产出摘要，保留 %s 条原文待下轮重试（本轮不删除）", len(outdated)
+        )
+        return {}
+    return {
+        "messages": [RemoveMessage(id=m.id) for m in outdated],
+        "history_summary": new_summary,
+    }
 
 
 def _render_for_summary(messages: list[Any]) -> str:
@@ -153,7 +187,12 @@ def _render_for_summary(messages: list[Any]) -> str:
 async def _summarize_history(prev_summary: str, outdated: list[Any]) -> str | None:
     """用便宜模型把旧消息（连同已有摘要）压缩成新的 running summary。
 
-    失败时沿用旧摘要，绝不因为压缩失败而丢失已有记忆。
+    **只有真正生成出摘要才返回非 None**；失败或模型返回空一律返回 None，
+    由调用方据此决定「不删原文」。
+
+    ⚠️ 这里绝对不能 fallback 成 `prev_summary`：那样调用方会把「沿用旧摘要」
+    误判成「压缩成功」，进而删掉原文——而这批原文根本没并进摘要，内容就静默丢了。
+    把「成功」与「失败」用返回值区分清楚，是 trim_history 能做原子决策的前提。
     """
     try:
         record_model_call("history_summary")
@@ -167,10 +206,13 @@ async def _summarize_history(prev_summary: str, outdated: list[Any]) -> str | No
             [SystemMessage(history_summary_system()), HumanMessage(human)]
         )
         summary = as_text(getattr(resp, "content", "")).strip()
-        return summary or prev_summary or None
+        if summary:
+            return summary
+        logger.warning("历史摘要模型返回空内容，本轮不压缩")
+        return None
     except Exception as exc:
-        logger.error("历史摘要生成失败，沿用旧摘要: %s", exc)
-        return prev_summary or None
+        logger.error("历史摘要生成失败，本轮不压缩（保留原文待下轮重试）: %s", exc)
+        return None
 
 
 def _summary_block(state: HmdpState) -> list[SystemMessage]:
@@ -306,10 +348,11 @@ async def grounding(state: HmdpState) -> dict:
     ids: list[int] = []
     names = [n for n in (plan.shop_names or []) if n]
 
-    # 1) 指代消解：这家 / 第二家 / 这两家 —— 依赖跨轮焦点，这是 focus_shops 必须入 State 的原因
+    # 1) 指代消解：这家 / 第二家 / 这三家 —— 依赖跨轮焦点，这是 focus_shops 必须入 State 的原因
     if not names and _ANAPHORA.search(query) and focus:
         if _PLURAL_ANAPHORA.search(query):
-            limit = 2 if re.search(r"两[家个]", query) else MAX_SHOPS
+            # 优先按用户明说的家数取（"这三家" → 3），否则按"两家"或上限兜底
+            limit = _plural_count(query) or (2 if re.search(r"两[家个]", query) else MAX_SHOPS)
             ids.extend(int(s["id"]) for s in focus[:limit] if s.get("id") is not None)
         else:
             idx = _ordinal_index(query)
@@ -330,20 +373,29 @@ async def grounding(state: HmdpState) -> dict:
                 break
 
     # 3) 按店名检索（支持一次提到多家店）
+    # 命中的店同步沉淀为跨轮焦点：这样「先分别问 A/B/C，再问这三家对比」时，
+    # 三家都在 focus_shops 里（累积 reducer 负责去重追加），指代解析才能落到实体上。
+    grounded_focus: list[dict] = []
     if not ids and names:
         for name in names[:MAX_SHOPS]:
+            hit = None
             item = await asyncio.to_thread(fetch_shops_by_name, name, 1, user_id)
             if isinstance(item, list) and item:
-                ids.append(int(item[0]["id"]))
-                continue
-            # 整串匹配失败时，去掉「餐厅/火锅/店」等通用品类后缀重试。
-            # 后端 /shop/of/name 按店名子串匹配，而「新白鹿餐厅」的店名实为「新白鹿(...)」。
-            norm = _normalize_shop_name(name)
-            if norm and norm != name:
-                item2 = await asyncio.to_thread(fetch_shops_by_name, norm, 1, user_id)
-                if isinstance(item2, list) and item2:
-                    logger.info("店名规范化重试命中: %r -> %r (id=%s)", name, norm, item2[0].get("id"))
-                    ids.append(int(item2[0]["id"]))
+                hit = item[0]
+            else:
+                # 整串匹配失败时，去掉「餐厅/火锅/店」等通用品类后缀重试。
+                # 后端 /shop/of/name 按店名子串匹配，而「新白鹿餐厅」的店名实为「新白鹿(...)」。
+                norm = _normalize_shop_name(name)
+                if norm and norm != name:
+                    item2 = await asyncio.to_thread(fetch_shops_by_name, norm, 1, user_id)
+                    if isinstance(item2, list) and item2:
+                        logger.info("店名规范化重试命中: %r -> %r (id=%s)", name, norm, item2[0].get("id"))
+                        hit = item2[0]
+            if hit is not None:
+                ids.append(int(hit["id"]))
+                focus_item = _to_focus_item(hit)
+                if focus_item is not None:
+                    grounded_focus.append(focus_item)
 
     # 去重保序
     ordered: list[int] = []
@@ -353,8 +405,12 @@ async def grounding(state: HmdpState) -> dict:
             seen.add(sid)
             ordered.append(sid)
 
-    logger.info("Grounding 解析到 shop_ids=%s（焦点 %s 家）", ordered, len(focus))
-    return {"shop_ids": ordered}
+    logger.info("Grounding 解析到 shop_ids=%s（历史焦点 %s 家，本轮新增 %s 家）",
+                ordered, len(focus), len(grounded_focus))
+    result: dict = {"shop_ids": ordered}
+    if grounded_focus:
+        result["focus_shops"] = grounded_focus
+    return result
 
 
 def _guess_shop_type(query: str, user_id: str) -> str:
@@ -394,6 +450,23 @@ def _normalize_shop_name(name: str) -> str:
             s = s.replace(w, "")
     s = s.strip()
     return s if s else (name or "").strip()
+
+
+def _to_focus_item(shop: Any) -> dict | None:
+    """把后端返回的店铺对象压成跨轮焦点项；无有效 id 返回 None。
+
+    nearby 结果、按店名检索命中的结果、以及 _collect_focus 里的沉淀都共用这一份，
+    避免字段名（后端是 avgPrice、State 里统一叫 avg_price）在多处各写一遍。
+    """
+    if not isinstance(shop, dict) or shop.get("id") is None:
+        return None
+    return {
+        "id": int(shop["id"]),
+        "name": shop.get("name"),
+        "distance": shop.get("distance"),
+        "avg_price": shop.get("avgPrice"),
+        "score": shop.get("score"),
+    }
 
 
 # ===========================================================================
@@ -462,17 +535,7 @@ async def nearby_worker(state: HmdpState) -> dict:
             }
 
     picked = shops[:NEARBY_TOP]
-    focus = [
-        {
-            "id": int(s.get("id")),
-            "name": s.get("name"),
-            "distance": s.get("distance"),
-            "avg_price": s.get("avgPrice"),
-            "score": s.get("score"),
-        }
-        for s in picked
-        if s.get("id") is not None
-    ]
+    focus = [item for item in (_to_focus_item(s) for s in picked) if item is not None]
     logger.info("附近找店：类型=%s 命中 %s 家", type_name, len(picked))
     return {
         "shop_ids": [int(s["id"]) for s in picked if s.get("id") is not None],
@@ -694,24 +757,20 @@ def _collect_sources(outputs: list[dict]) -> list[str]:
 
 
 def _collect_focus(outputs: list[dict], fallback: list[dict]) -> list[dict]:
-    """把本轮实际用到的店铺沉淀为下一轮的焦点，供"这家/第二家"解析。"""
+    """把本轮实际用到的店铺沉淀为跨轮焦点（累积 reducer 负责去重追加）。
+
+    本轮没有 nearby 产出时返回 fallback（= 已累积的焦点列表），reducer 去重后不会重复追加。
+    """
     focus: list[dict] = []
     seen: set[int] = set()
     for item in outputs or []:
         if item.get("worker") == "nearby":
             for shop in item.get("shops") or []:
-                sid = shop.get("id")
-                if sid is not None and int(sid) not in seen:
-                    seen.add(int(sid))
-                    focus.append(
-                        {
-                            "id": int(sid),
-                            "name": shop.get("name"),
-                            "distance": shop.get("distance"),
-                            "avg_price": shop.get("avgPrice"),
-                            "score": shop.get("score"),
-                        }
-                    )
+                focus_item = _to_focus_item(shop)
+                if focus_item is None or focus_item["id"] in seen:
+                    continue
+                seen.add(focus_item["id"])
+                focus.append(focus_item)
     if focus:
         return focus[:NEARBY_TOP]
     return list(fallback or [])

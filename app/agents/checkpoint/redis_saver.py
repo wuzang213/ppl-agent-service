@@ -90,7 +90,7 @@ class AsyncRedisCheckpointSaver(BaseCheckpointSaver[str]):
     用法：
 
     ```python
-    client = aioredis.from_url("redis://192.168.150.101:6379/0")
+    client = aioredis.from_url("redis://localhost:6379/0")
     saver = AsyncRedisCheckpointSaver(client, prefix="agent:checkpoint")
     await saver.asetup()
     graph = builder.compile(checkpointer=saver)
