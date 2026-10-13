@@ -8,3 +8,11 @@ app/static/
 db/
 test/
 .env
+
+# 密钥 / 证书类（一律不得入库）
+*.jks
+*.pem
+*.key
+*.p12
+.env.local
+.env.*.local

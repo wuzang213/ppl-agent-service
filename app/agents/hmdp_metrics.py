@@ -1,16 +1,13 @@
 """Agent 请求指标采集与三次重试。"""
 
-import asyncio
 import json
 import time
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import aiosqlite
-from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.middleware.types import ModelRequest, ModelResponse
-from langchain_core.messages import AIMessage
+from langchain.agents.middleware.types import ModelResponse
 
 _metrics: ContextVar[dict[str, Any]] = ContextVar("hmdp_metrics", default=None)
 
@@ -96,6 +93,25 @@ def record_usage_from_message(message: Any) -> None:
     )
 
 
+# 历史压缩前后「估算 token」在 metrics 数据字典里的键名（仅本轮进程内可见）。
+HISTORY_EST_TOKENS_KEY = "history_est_tokens"
+
+
+def record_history_tokens(before_tokens: int, after_tokens: int) -> None:
+    """记录一次历史压缩前后的估算 token 数（估算值，非模型真实用量）：写入本轮 metrics 的新增键与
+    `tools_called`；`prompt_tokens` / `completion_tokens` / `total_tokens` 仍只放模型真实用量，估算值不混入。
+    metrics 上下文未初始化（子任务 / 直接调用）时静默跳过，同一标记不重复追加。"""
+    data = _metrics.get()
+    if data is None:
+        return
+    before = int(before_tokens or 0)
+    after = int(after_tokens or 0)
+    data[HISTORY_EST_TOKENS_KEY] = {"before": before, "after": after}
+    marker = f"history_trim:{before}->{after}"
+    if marker not in data["tools_called"]:
+        data["tools_called"].append(marker)
+
+
 def _collect_usage(response: ModelResponse) -> None:
     data = _ensure_metrics()
     for message in response.result or []:
@@ -110,50 +126,6 @@ def _collect_usage(response: ModelResponse) -> None:
         data["prompt_tokens"] += usage.get("input_tokens", usage.get("prompt_tokens", 0))
         data["completion_tokens"] += usage.get("output_tokens", usage.get("completion_tokens", 0))
         data["total_tokens"] += usage.get("total_tokens", 0)
-
-
-class ModelRetryMetricsMiddleware(AgentMiddleware):
-    """最多尝试 3 次模型调用，记录调用次数与 token，3 次失败抛异常。"""
-
-    def wrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], ModelResponse],
-    ) -> ModelResponse:
-        data = _ensure_metrics()
-        for attempt in range(1, 4):
-            data["model_call_count"] += 1
-            try:
-                response = handler(request)
-                _collect_usage(response)
-                return response
-            except Exception as exc:
-                data["model_failure_count"] += 1
-                data["error"] = str(exc)
-                if attempt == 3:
-                    raise
-                time.sleep(min(1.5 ** attempt, 5))
-        return None
-
-    async def awrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], Any],
-    ) -> ModelResponse:
-        data = _ensure_metrics()
-        for attempt in range(1, 4):
-            data["model_call_count"] += 1
-            try:
-                response = await handler(request)
-                _collect_usage(response)
-                return response
-            except Exception as exc:
-                data["model_failure_count"] += 1
-                data["error"] = str(exc)
-                if attempt == 3:
-                    raise
-                await asyncio.sleep(min(1.5 ** attempt, 5))
-        return None
 
 
 async def save_metrics(data: dict[str, Any]) -> None:

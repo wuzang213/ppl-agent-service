@@ -1,10 +1,10 @@
 """Agent 对话路由。"""
 
 import asyncio
-from typing import Literal, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sse_starlette import EventSourceResponse
 
 from app.agents.hmdp_agent import hmdp_agent
@@ -15,13 +15,36 @@ router = APIRouter()
 
 
 class HmdpChatRequest(BaseModel):
-    message: str
+    #: 必须容忍非字符串：前端澄清卡选项 value 可能为数字，直接回传会触发 Pydantic 422 string_type。
+    #: 校验前归一化为字符串，兼容前端发 value / label / 字符串数字三种写法。
+    #: 只放宽类型不改语义：空串仍由下游 entry_router 按"空问题"处理。
+    message: str = ""
+
+    @field_validator("message", mode="before")
+    @classmethod
+    def _coerce_message(cls, value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            # JSON 里 `2` 与 `2.0` 都能到这儿；浮点整数值要还原成 `"2"`，
+            # 否则槽位抽出会看到 `"2.0"`（多一位小数，虽不致命但没必要）。
+            return str(int(value))
+        return str(value)
+
     thread_id: str = ""
-    mode: Literal["daily", "recommend"] = "recommend"
     x: Optional[float] = None
     y: Optional[float] = None
     user_id: str = ""
     interrupt_decision: Optional[dict] = None
+    #: 结构化动作（plans/0019）：`{type, args}`，预约写路径唯一入口（booking 建单 / confirm 确认）。
+    #: 不复用 interrupt_decision：旧中断流程已移除，该参数被忽略，复用会让确认动作静默失效。
+    action: Optional[dict] = None
+    #: 结构化澄清载荷（`specs/0025`）：前端澄清卡把每个槽位按**标准化结构**回传
+    #: （时间 `{type,start,end}` / 人数·预算数值 / 区域·场景枚举或文本），后端**直接映射槽位、跳过文本抽槽链路**。
+    #: 与原 `message` 文本通道**并存、向下兼容**（字段可选；不传时走原文本抽槽 + 规则校验）。不影响预约 `action`。
+    clarify_slots: Optional[dict] = None
 
 
 def _resolve_thread_id(thread_id: str, user_id: str) -> str:
@@ -57,8 +80,9 @@ async def chat_stream(
             user_id=user_id,
             x=request.x,
             y=request.y,
-            mode=request.mode,
             interrupt_decision=request.interrupt_decision,
+            action=request.action,
+            clarify_slots=request.clarify_slots,
         )
     )
 
@@ -77,8 +101,9 @@ async def chat_send(
             user_id=user_id,
             x=request.x,
             y=request.y,
-            mode=request.mode,
             interrupt_decision=request.interrupt_decision,
+            action=request.action,
+            clarify_slots=request.clarify_slots,
         )
     )
 

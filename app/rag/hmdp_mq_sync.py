@@ -7,18 +7,23 @@ import os
 from collections import OrderedDict
 
 import aio_pika
+from dotenv import load_dotenv
 
+from app.common.config import require_env
 from app.common.logger import logger
 from app.rag.hmdp_rag import sync_blog_by_id
+
+load_dotenv()
 
 RAG_MQ_SYNC = os.getenv("RAG_MQ_SYNC", "true").lower() == "true"
 EXCHANGE = os.getenv("RABBITMQ_CACHE_SYNC_EXCHANGE", "cache.sync.fanout")
 QUEUE = os.getenv("RAG_SYNC_QUEUE", "agent.rag.sync.queue")
-RABBITMQ_HOST = os.getenv("RABBITMQ_HOST")  # 由 .env 注入，不写死默认值
-RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
-RABBITMQ_USER = os.getenv("RABBITMQ_USER")  # 由 .env 注入，不写死默认值
-RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD")  # 由 .env 注入，不写死默认值
-RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/hm-dianping")
+# 部署关键：连哪台 MQ、用什么凭证必须显式配置，缺失即启动失败（不再静默回退到固定地址/弱口令）。
+RABBITMQ_HOST = require_env("RABBITMQ_HOST")
+RABBITMQ_PORT = int(require_env("RABBITMQ_PORT"))
+RABBITMQ_USER = require_env("RABBITMQ_USER")
+RABBITMQ_PASSWORD = require_env("RABBITMQ_PASSWORD")
+RABBITMQ_VHOST = require_env("RABBITMQ_VHOST")
 
 # 限制重试次数，超过 3 次后 reject(requeue=False) 进死信
 _RETRY_LIMIT = 3

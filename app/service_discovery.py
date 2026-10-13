@@ -1,27 +1,22 @@
 """Nacos 服务发现：为 agent 出站调用 Java 微服务提供动态实例解析。
-
-设计要点：
-- 默认优先使用 .env 中显式配置的静态地址（SHOP/BLOG/VOUCHER_SERVICE_URL，如 localhost:8082），
-  该地址由使用者验证可达，是最稳妥的选择。
-- 仅当 .env 未配置（为空）时，才回落到 Nacos 命名服务拉取的 *健康* 实例地址
-  （自带 LB + 故障转移 + 地址动态）。
-- 本地缓存 + 定时刷新；Nacos 不可用或解析不到时，不影响已配置的静态地址。
-- resolve() 是同步、无网络 IO、永不抛异常的纯查表操作，保证出站请求绝不被阻塞。
-
-注意：Spring Cloud 默认用机器局域网 IP（如 172.x.x.x / 192.168.x.x）注册到 Nacos，该地址在
-agent 运行时未必可达（防火墙 / 仅监听回环 / 跨容器网络）。因此 .env 静态地址（localhost）优先，
-避免"Nacos 有实例却连不通"反而劣于写死地址的情况。
-
-"""
+优先用 .env 显式配置的静态地址（SHOP/BLOG/VOUCHER_SERVICE_URL，如 localhost:8082，使用者已验证可达），仅当为空时才回落 Nacos 拉取的健康实例（自带 LB + 故障转移），本地缓存 + 定时刷新；`resolve()` 同步、无 IO、永不抛异常。
+Spring Cloud 默认把机器局域网 IP（如 10.x.x.x）注册到 Nacos，agent 运行时未必可达（防火墙 / 仅监听回环 / 跨容器网络），故静态地址优先。"""
 
 import asyncio
 import os
 import threading
 from typing import Optional
 
+from dotenv import load_dotenv
 from v2.nacos import ClientConfigBuilder, ListInstanceParam, NacosNamingService
 
+from app.common.config import require_env
 from app.common.logger import logger
+
+load_dotenv()
+
+# 部署关键：连哪台 Nacos 必须显式配置，缺失即启动失败（不再静默回退到固定地址）。
+NACOS_SERVER_ADDRS = require_env("NACOS_SERVER_ADDRS")
 
 # 逻辑服务 key -> Nacos 中 Java 服务的注册名（可经 env 覆盖，默认与 Spring 注册名一致）
 SERVICE_NAMES = {
@@ -47,7 +42,7 @@ _thread: Optional[threading.Thread] = None
 
 def _client_config():
     builder = ClientConfigBuilder().server_address(
-        os.getenv("NACOS_SERVER_ADDRS", "")
+        NACOS_SERVER_ADDRS
     ).namespace_id(os.getenv("NACOS_NAMESPACE", ""))
     username = os.getenv("NACOS_USERNAME", "")
     password = os.getenv("NACOS_PASSWORD", "")
@@ -111,11 +106,9 @@ async def _run() -> None:
 
 
 def start_discovery() -> None:
-    """应用启动时调用（main.py lifespan）。NACOS_SERVER_ADDRS 未配置则静默不启用。"""
+    """应用启动时调用（main.py lifespan）。NACOS_SERVER_ADDRS 缺失会在导入期即 fail-fast，
+    这里不再做“空则跳过”——连接失败由 _run 优雅降级为使用 .env 静态地址。"""
     global _thread
-    if not os.getenv("NACOS_SERVER_ADDRS"):
-        logger.info("NACOS_SERVER_ADDRS 未配置，出站调用使用 .env 静态地址")
-        return
     _stop.clear()
     _thread = threading.Thread(
         target=lambda: asyncio.run(_run()), name="nacos-discovery", daemon=True
@@ -129,14 +122,8 @@ def stop_discovery() -> None:
 
 
 def resolve(key: str) -> str:
-    """返回逻辑服务的 base_url：优先 .env 静态地址，否则回落 Nacos 发现的实例。
-
-    同步、无 IO、永不抛异常——保证出站请求不被阻塞。
-
-    优先级说明：
-    - .env 中的 SHOP/BLOG/VOUCHER_SERVICE_URL 优先（使用者已验证可达，如 localhost:8082）；
-    - 仅当 .env 对应地址为空时，才使用 Nacos 服务发现解析到的健康实例地址。
-    """
+    """返回逻辑服务的 base_url：优先 .env 静态地址（`SHOP/BLOG/VOUCHER_SERVICE_URL`，如 localhost:8082），
+    仅当地址为空时才用 Nacos 服务发现解析到的健康实例。同步、无 IO、永不抛异常 —— 保证出站请求不被阻塞。"""
     fallback = FALLBACK_URLS.get(key, "")
     if fallback:
         return fallback

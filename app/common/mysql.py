@@ -1,38 +1,6 @@
-"""agent-service 的共享关系型存储（MySQL / aiomysql 连接池）。
-
-## 为什么需要它
-
-会话的**元数据**（`sessions` 表：thread_id / user_id / biz_type / name / 时间戳）原本存在本地文件
-`db/sessions.db`（`sqlite3` 直连）。单进程下没问题，但多实例部署时：
-
-- 实例 A 创建的会话，在实例 B 的 `GET /sessions` 里**看不到**；
-- `DELETE /sessions/{id}` 的归属校验查不到记录，会把合法请求误判成 403。
-
-对话历史（checkpoint）已经搬到 Redis，会话元数据必须同样搬到**进程外共享**存储，多实例才成立。
-
-## 存储选型
-
-Java 侧四个业务服务已经共用一个 MySQL 实例（各自独立 database：`hmdp_blog` / `hmdp_shop` /
-`hmdp_user` / `hmdp_voucher`），而 `sessions` 是一张规整的小表，正好适合关系型库，所以按同一
-口径接入：**同一个实例、独立 database `hmdp_agent`**（独立库是本项目的既有约定，避免跨服务
-建外键/互相读表）。连接参数默认取 Nacos `shared-jdbc.yaml` 的同口径（本机 MySQL，root / 无密码）；
-部署到其它环境请通过 `MYSQL_*` 环境变量覆盖，**切勿在代码里写死内网地址或账号密码**。
-
-## 为什么用连接池
-
-aiomysql 是 asyncio 驱动，每次 `connect()` 都是一次真实 TCP + 握手 + 认证往返。会话接口虽然
-QPS 不高，但把建连代价摊到每个请求上没有意义，所以这里维护一个全局 `Pool`：启动时
-`init_mysql_pool()` 建池并预热，请求期 `acquire_cursor()` 借连接，`close_mysql_pool()` 归还。
-
-`pool_recycle` 默认 1 小时：MySQL 侧 `wait_timeout` 默认 8 小时，空闲超时后服务端会单方面断开，
-池里就会留下"看起来还活着"的死连接，第一个用到的请求会莫名报错。
-
-## 建库建表不在这里
-
-本模块**只负责连接**，不建库、不建表。库和表由部署方执行 `sql/` 下的脚本创建
-（DDL 的唯一权威，见 `sql/README.md`），避免"代码里一份 DDL + 脚本里一份 DDL"两处漂移。
-应用启动时用 `verify_tables()` 校验必需的表是否存在，缺失即 fail fast 并提示该执行哪个脚本。
-"""
+"""agent-service 的共享关系型存储（MySQL / aiomysql 连接池）：会话元数据 `sessions` 原存本地 `db/sessions.db`（sqlite3），多实例下互相看不见、`DELETE` 归属校验还会误判 403，故改为进程外共享存储。
+与 Java 侧共用同一 MySQL 实例、**独立 database `hmdp_agent`**（默认连本机 `127.0.0.1:3306`、无密码，可用 `MYSQL_*` 覆盖）；用全局 `Pool` 避免每请求一次建连，`pool_recycle` 默认 1 小时（MySQL `wait_timeout` 默认 8 小时，否则池里会留下"看起来还活着"的死连接）。
+本模块**只负责连接**，不建库、不建表（DDL 唯一权威是 `sql/` 下的脚本，见 `sql/README.md`）；启动时 `verify_tables()` 校验必需表，缺失即 fail fast 并提示该执行哪个脚本。"""
 
 from __future__ import annotations
 
@@ -75,11 +43,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 def safe_identifier(name: str) -> str:
-    """校验库名/表名。
-
-    库名要拼进 DDL（标识符不能用占位符传），所以这里做白名单校验，拒绝任何可能改变
-    语句结构的内容。参数值仍然一律走 `%s` 占位符，不受此影响。
-    """
+    """校验库名/表名：库名要拼进 DDL（标识符不能用占位符传），故做白名单校验，
+    拒绝任何可能改变语句结构的内容；参数值仍一律走 `%s` 占位符。"""
     if not _IDENTIFIER_RE.match(name):
         raise RuntimeError(f"非法的 MySQL 标识符：{name!r}（只允许字母、数字、下划线）")
     return name
@@ -101,10 +66,8 @@ def build_mysql_config() -> dict[str, Any]:
 
 async def init_mysql_pool() -> aiomysql.Pool:
     """初始化全局连接池（幂等）。在 FastAPI lifespan 启动阶段调用。
-
-    **不建库、不建表** —— 库/表由部署方执行 `sql/` 下的脚本创建。
-    库不存在时 aiomysql 会抛 `Unknown database`，下面会把它包装成带建表指引的可读错误。
-    """
+    **不建库、不建表**（库/表由部署方执行 `sql/` 下的脚本创建）；库不存在时 aiomysql 会抛
+    `Unknown database`，下面会把它包装成带建表指引的可读错误。"""
     global _pool
     if _pool is not None:
         return _pool
@@ -140,16 +103,34 @@ async def init_mysql_pool() -> aiomysql.Pool:
 _TABLE_SCRIPTS = {
     "sessions": "sql/agent_session.sql",
     "agent_message": "sql/agent_message.sql",
+    # 运行账本（`specs/0013`）：一次请求 1 行头 + 每次模型/工具调用各 1 行，按 run_id 关联。
+    # 三张表一同登记在 `main.REQUIRED_TABLES` ⇒ 缺表即启动失败，并提示执行这一个脚本。
+    "agent_runs": "sql/agent_ledger.sql",
+    "agent_llm_calls": "sql/agent_ledger.sql",
+    "agent_tool_calls": "sql/agent_ledger.sql",
+}
+
+# (表, 列) → **增量**脚本：列缺失时给出"该执行哪个文件"的指引。`sql/` 只增不改，故历史脚本不动。
+_COLUMN_SCRIPTS = {
+    ("agent_message", "payload"): "sql/agent_message_add_payload.sql",
+    # 账本「上下文」增量列（`specs/0017` T1）：query / 意图路由 / 卡片摘要，供冻结行为回归集。
+    # 六列同出一个脚本（`sql/agent_ledger_add_context.sql`，幂等）。
+    ("agent_runs", "query_text"): "sql/agent_ledger_add_context.sql",
+    ("agent_runs", "scene"): "sql/agent_ledger_add_context.sql",
+    ("agent_runs", "sub_intents"): "sql/agent_ledger_add_context.sql",
+    ("agent_runs", "depends_on"): "sql/agent_ledger_add_context.sql",
+    ("agent_runs", "card_digest"): "sql/agent_ledger_add_context.sql",
+    ("agent_runs", "answer_digest"): "sql/agent_ledger_add_context.sql",
 }
 
 
-async def verify_tables(tables: Iterable[str]) -> None:
-    """启动时校验必需的表是否存在；缺失则抛错并指出对应的建表脚本。
-
-    刻意**不自动建表**：表结构由部署方执行 `sql/` 下的脚本创建，代码里只保留读写逻辑。
-    但"不建表"≠"不检查" —— 缺表时在**启动期**就明确失败，好过运行时第一个请求才报错
-    （那时错误信息离根因很远，排查成本高）。
-    """
+async def verify_tables(
+    tables: Iterable[str],
+    required_columns: "dict[str, Iterable[str]] | None" = None,
+) -> None:
+    """启动时校验必需的表（及可选列）是否存在；缺失则抛错并指出该执行哪个脚本。
+    刻意不自动建表/改表（DDL 权威是 sql/ 脚本），缺失即在启动期 fail-fast，好过首请求才报错。
+    列校验面向"只增不改"的增量脚本：代码先读新列而脚本未执行，否则首请求才抛 Unknown column。"""
     names = list(dict.fromkeys(tables))
     if not names:
         return
@@ -172,6 +153,32 @@ async def verify_tables(tables: Iterable[str]) -> None:
             f"数据库 {database} 缺少必需的表：{', '.join(missing)}。"
             f"请先执行建表脚本（{hints}）后重启服务。"
         )
+
+    # ---- 列校验（可选）：只看已存在的表 ----
+    for table, cols in (required_columns or {}).items():
+        want = list(dict.fromkeys(cols))
+        if not want or table not in found:
+            continue
+        col_placeholders = ", ".join(["%s"] * len(want))
+        async with acquire_cursor() as cur:
+            await cur.execute(
+                "SELECT column_name AS c FROM information_schema.columns "
+                f"WHERE table_schema = %s AND table_name = %s "
+                f"AND column_name IN ({col_placeholders})",
+                [database, table, *want],
+            )
+            col_rows = await cur.fetchall()
+        present = {r["c"] for r in col_rows}
+        missing_cols = [c for c in want if c not in present]
+        if missing_cols:
+            hints = "；".join(
+                f"`{table}.{c}` → {_COLUMN_SCRIPTS.get((table, c), 'sql/')}"
+                for c in missing_cols
+            )
+            raise RuntimeError(
+                f"数据库 {database} 的表 `{table}` 缺少必需列：{', '.join(missing_cols)}。"
+                f"请先执行增量脚本（{hints}）后重启服务。"
+            )
 
     logger.info("数据表校验通过：%s（库 %s）", ", ".join(names), database)
 
@@ -196,10 +203,8 @@ def get_mysql_pool() -> aiomysql.Pool:
 @asynccontextmanager
 async def acquire_cursor(*, dict_rows: bool = True) -> AsyncIterator[Any]:
     """借一个 cursor 用，退出时自动归还连接到池。
-
-    `autocommit=True` 已开，所以这里不做 commit / rollback —— 单条语句失败不会留下半截事务。
-    需要多语句原子性的场景请自行 `pool.acquire()` 后显式 begin/commit。
-    """
+    `autocommit=True` 已开，故这里不做 commit / rollback（单条语句失败不会留下半截事务）；
+    需要多语句原子性的场景请自行 `pool.acquire()` 后显式 begin/commit。"""
     pool = get_mysql_pool()
     async with pool.acquire() as conn:
         cursor_cls = aiomysql.DictCursor if dict_rows else aiomysql.Cursor

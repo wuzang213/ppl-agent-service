@@ -1,20 +1,6 @@
-"""checkpoint 后端的选型与构造。
-
-可用环境变量：
-
-==============================  ==========================================================
-变量                             说明
-==============================  ==========================================================
-``AGENT_CHECKPOINT_BACKEND``    ``redis``（默认）| ``sqlite``。出问题时一键回退。
-``AGENT_CHECKPOINT_REDIS_URL``  完整连接串，给了就用它（优先级最高）
-``REDIS_HOST`` / ``REDIS_PORT``  没给 URL 时按分项拼装
-``REDIS_PASSWORD``              留空表示不发 AUTH
-``REDIS_DB``                    默认 ``0``
-``AGENT_CHECKPOINT_KEY_PREFIX`` Redis key 前缀，默认 ``agent:checkpoint``
-``AGENT_CHECKPOINT_SQLITE_PATH`` 回退到 sqlite 时的库文件路径，默认 ``db/hmdp_agent.db``
-==============================  ==========================================================
-
-"""
+"""checkpoint 后端选型与构造：``AGENT_CHECKPOINT_BACKEND`` = ``redis``（默认）| ``sqlite``（本地文件，多实例读不到历史）。
+连接串取 ``AGENT_CHECKPOINT_REDIS_URL``（优先）或 ``REDIS_HOST`` / ``REDIS_PORT`` / ``REDIS_DB`` / ``REDIS_PASSWORD``；
+前缀 ``AGENT_CHECKPOINT_KEY_PREFIX``（默认 ``agent:checkpoint``）、``AGENT_CHECKPOINT_SQLITE_PATH``（默认 ``db/hmdp_agent.db``）；混用两后端会让同一 thread 状态分叉，故失败即快速失败。"""
 
 from __future__ import annotations
 
@@ -67,10 +53,8 @@ def mask_url(url: str) -> str:
 
 
 async def create_checkpointer() -> CheckpointerHandle:
-    """按 ``AGENT_CHECKPOINT_BACKEND`` 构造 checkpointer。
-
-    @return ``(checkpointer, aclose)``，调用方负责在停机时 ``await aclose()``
-    """
+    """按 ``AGENT_CHECKPOINT_BACKEND`` 构造 checkpointer；返回 ``(checkpointer, aclose)``，
+    调用方负责在停机时 ``await aclose()``。"""
     backend = _env("AGENT_CHECKPOINT_BACKEND", DEFAULT_BACKEND).lower() or DEFAULT_BACKEND
     if backend == "redis":
         return await _create_redis_checkpointer()
@@ -102,7 +86,9 @@ async def _create_redis_checkpointer() -> CheckpointerHandle:
         # 连不上就立刻把连接池关掉，别把句柄泄漏出去
         await saver.aclose()
         raise
-    logger.info("checkpoint 后端 = redis（url={}，key 前缀={}）", mask_url(url), saver.prefix)
+    # 必须用 `%s` 而非 `{}`：logging 惰性插值是 `msg % args`，写 `{}` 会抛 TypeError
+    #    并被 logging 吞成一行 `--- Logging error ---` ⇒ 这条日志永远打不出来（静默丢日志）。
+    logger.info("checkpoint 后端 = redis（url=%s，key 前缀=%s）", mask_url(url), saver.prefix)
     return saver, saver.aclose
 
 
@@ -116,7 +102,7 @@ async def _create_sqlite_checkpointer() -> CheckpointerHandle:
     saver = AsyncSqliteSaver(conn=conn)
     await saver.setup()
     logger.warning(
-        "checkpoint 后端 = sqlite（本地文件 {}）：多实例部署时各实例会各存各的会话状态，"
+        "checkpoint 后端 = sqlite（本地文件 %s）：多实例部署时各实例会各存各的会话状态，"
         "仅建议本地调试使用；要切回 Redis 把 AGENT_CHECKPOINT_BACKEND 设为 redis",
         path,
     )

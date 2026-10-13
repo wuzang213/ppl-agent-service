@@ -1,24 +1,6 @@
-"""会话元数据的 MySQL 存储。
-
-**原实现**：`sqlite3` 直连本地文件 `db/sessions.db`。多实例部署下实例之间互不可见。
-**现实现**：MySQL 独立库 `hmdp_agent`，表 `sessions`，与 Java 侧共用同一个 MySQL 实例
-（连接池与选型说明见 `app/common/mysql.py` 的模块注释）。
-
-对外接口（`create_session` / `get_sessions` / `delete_session`）的**签名与返回结构都没变**，
-只是从同步改成了 async —— 因为 aiomysql 是协程驱动，阻塞调用会卡住整个事件循环。
-
-## 时间戳口径
-
-`created_at` / `updated_at` 由**应用侧**写入 `datetime.now()`（本地墙钟时间，带微秒），
-DDL 里刻意**不加** `DEFAULT CURRENT_TIMESTAMP` / `ON UPDATE CURRENT_TIMESTAMP`。
-
-原因：MySQL 实例的 `time_zone` 是 `SYSTEM` = **UTC**（实测 `NOW()` 比本地时间少 8 小时），
-一旦用 `CURRENT_TIMESTAMP` 兜底，同一列里会混进 UTC 值；而接口是把列值 `isoformat()` 后
-原样返回给前端的，混了就会让部分会话的显示时间差 8 小时。
-
-保持"应用侧写入本地时间"也和改造前的行为完全一致：原来 `datetime.now().isoformat()` 产出
-`2026-09-13T16:40:27.123456`，现在 `DATETIME(6)` 读回来再 `isoformat()`，字符串一模一样。
-"""
+"""会话元数据的 MySQL 存储（库 `hmdp_agent`，表 `sessions`；连接池见 `app/common/mysql.py`）。原为本地 `sqlite3`
+文件、多实例互不可见；对外接口签名与返回结构未变，仅因 aiomysql 改为 async。时间戳由应用写 `datetime.now()`，
+DDL 刻意不加 `DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP`（MySQL 时区为 UTC，兜底会混进差 8 小时的值）。"""
 
 import uuid
 from datetime import datetime
@@ -59,9 +41,9 @@ class SessionResponse(BaseModel):
     updated_at: str
 
 
-# ⚠️ 表结构不在代码里维护：本模块只做数据读写，不建表。
-# DDL 的唯一权威是 sql/agent_session.sql（由部署方执行）；
-# 应用启动时只校验表是否存在（app.common.mysql.verify_tables），缺失即启动失败并提示脚本路径。
+# 表结构不在代码里维护：DDL 唯一权威是 sql/agent_session.sql（部署方执行），本模块只做数据读写；
+# 启动时只校验表是否存在（app.common.mysql.verify_tables），缺失即启动失败。
+# 要点：`datetime(6)` 保留微秒（isoformat() 与改造前一致）；不写 DEFAULT CURRENT_TIMESTAMP；(user_id, biz_type, updated_at) 联合索引覆盖 GET /sessions。
 
 
 def _iso(value: object) -> str:
@@ -137,11 +119,7 @@ async def get_sessions(
 
 
 async def get_session(thread_id: str) -> Optional[SessionResponse]:
-    """按主键取单条会话，不存在返回 None。
-
-    用途：归属/存在性校验。以前是「把该用户的全部会话列出来再逐个比对」，
-    现在是主键查询 —— 既省一次全表扫描，也能区分「不存在」与「不是你的」。
-    """
+    """按主键取单条会话，不存在返回 None。用于归属/存在性校验：主键查询省一次全表扫描，且能区分「不存在」与「不是你的」。"""
     async with acquire_cursor() as cur:
         await cur.execute(
             f"SELECT thread_id, user_id, biz_type, name, created_at, updated_at "

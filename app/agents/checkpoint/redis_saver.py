@@ -1,6 +1,6 @@
-"""不依赖任何 Redis 模块（RediSearch / RedisJSON）的 LangGraph checkpoint saver。
-
-"""
+"""零 Redis 模块依赖的 LangGraph checkpoint saver：只用 Hash / ZSet / Set / String（官方实现要求 Redis Stack 的 ``FT.CREATE``）。
+key（``p`` = 前缀，各段经 URL 编码）：``{p}:ckpt:{t}:{ns}:{c}`` / ``{p}:ckptids:{t}:{ns}`` / ``{p}:wk:{t}:{ns}:{c}:{k}`` / ``{p}:wtids:{t}:{ns}:{c}`` / ``{p}:ns:{t}`` / ``{p}:threads``。
+ZSet 全员同分、靠成员字典序当有序索引；不设 TTL（清理走 ``adelete_thread``，即 ``DELETE /sessions/{id}``），``alist`` 跨 thread 顺序与官方 SQL 版略有差异。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import random
 from collections.abc import AsyncIterator, Awaitable, Iterator, Sequence
 from typing import Any, cast
 from urllib.parse import quote
+
+from app.common.logger import logger
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -31,10 +33,7 @@ _SEP = b"\x00"
 def _pack(type_tag: str, payload: bytes) -> bytes:
     """``type 标签 + \\x00 + base64(序列化结果)``。
 
-    为什么 payload 走 base64：checkpoint 的序列化结果是 msgpack/pickle 这类二进制，
-    直接塞进 Redis 也能存（Redis 是二进制安全的），但 base64 让 ``redis-cli HGET``
-    能直接看到内容，排查线上问题时省一次脚本解码。体积代价约 +33%，可接受。
-    """
+    base64 是为了让 ``redis-cli HGET`` 直接看到内容（二进制本也能存，Redis 二进制安全），代价体积约 +33%。"""
     return type_tag.encode("utf-8") + _SEP + base64.b64encode(payload)
 
 
@@ -63,11 +62,8 @@ def _as_text(raw: Any) -> str:
 
 
 def _metadata_matches(metadata: dict[str, Any], criteria: dict[str, Any] | None) -> bool:
-    """复刻 SQL 版 ``search_where`` 的 metadata 过滤语义。
-
-    SQL 版走 ``json_extract(metadata, '$.key') <op> ?``：JSON 对象/数组会被规范化后
-    整体比较，布尔值会被 ``json_extract`` 转成 1/0。这里对已解析的 dict 做等价判断。
-    """
+    """复刻 SQL 版 ``search_where`` 的语义：SQL 走 ``json_extract(metadata, '$.key') <op> ?``，
+    布尔值会被转成 1/0；这里对已解析的 dict 做等价判断。"""
     if not criteria:
         return True
     for key, expected in criteria.items():
@@ -85,19 +81,8 @@ def _metadata_matches(metadata: dict[str, Any], criteria: dict[str, Any] | None)
 
 
 class AsyncRedisCheckpointSaver(BaseCheckpointSaver[str]):
-    """只用基础 Redis 命令实现的异步 checkpoint saver。
-
-    用法：
-
-    ```python
-    client = aioredis.from_url("redis://localhost:6379/0")
-    saver = AsyncRedisCheckpointSaver(client, prefix="agent:checkpoint")
-    await saver.asetup()
-    graph = builder.compile(checkpointer=saver)
-    # 关闭时
-    await saver.aclose()
-    ```
-    """
+    """只用基础 Redis 命令实现的异步 checkpoint saver；用法：``AsyncRedisCheckpointSaver(client, prefix=...)``
+    → ``await asetup()`` → ``builder.compile(checkpointer=saver)``，停机时 ``await aclose()``。"""
 
     def __init__(
         self,
@@ -121,12 +106,8 @@ class AsyncRedisCheckpointSaver(BaseCheckpointSaver[str]):
     # key 构造
     # ------------------------------------------------------------------
     def _seg(self, part: str) -> str:
-        """URL 编码单个 key 段。
-
-        ``checkpoint_ns`` 里本身带 ``:``（子图命名空间形如 ``node:task_id``），
-        直接拼进 key 会让「不同 (thread, ns) 组合」有机会撞到同一个 key。
-        thread_id 目前是 UUID 不会撞，但编码一下成本为零、也免掉未来的隐含约束。
-        """
+        """URL 编码单个 key 段：``checkpoint_ns`` 形如 ``node:task_id`` 本身带 ``:``，
+        不编码会让不同 (thread, ns) 组合撞到同一个 key。"""
         return quote(part, safe="")
 
     def _ckpt_key(self, thread: str, ns: str, cid: str) -> str:
@@ -152,11 +133,7 @@ class AsyncRedisCheckpointSaver(BaseCheckpointSaver[str]):
     # 生命周期
     # ------------------------------------------------------------------
     async def asetup(self) -> None:
-        """本实现不需要建索引/建表，只做一次连通性探测。
-
-        这是与官方 ``AsyncRedisSaver`` 最本质的区别：官方要在这里 ``FT.CREATE``，
-        普通 Redis 会直接失败。
-        """
+        """只做一次连通性探测，不建索引/建表 —— 官方 ``AsyncRedisSaver`` 会在这里 ``FT.CREATE``，普通 Redis 直接失败。"""
         if self._setup_done:
             return
         await self.redis.ping()
@@ -350,7 +327,15 @@ class AsyncRedisCheckpointSaver(BaseCheckpointSaver[str]):
             pipe.zadd(self._ckpt_ids_key(thread, ns), {cid: 0})
             pipe.sadd(self._namespaces_key(thread), ns)
             pipe.sadd(self._threads_key(), thread)
-            await pipe.execute()
+            # Redis 不可用时不能把异常抛给上层：异常会一路穿到 generate_sse 的 async for，导致整条 SSE 中断、接口 500 且 traceback 吐给客户端。
+            # checkpoint 是可丢的旁路（丢只本轮不落库，下轮照常），故降级为 error 日志 + 放行。
+            try:
+                await pipe.execute()
+            except Exception as exc:
+                logger.error(
+                    "checkpoint 写入失败（已降级，本轮不落库）: thread=%s ckpt=%s err=%s: %s",
+                    thread, cid, type(exc).__name__, exc,
+                )
 
         return {
             "configurable": {
@@ -391,7 +376,14 @@ class AsyncRedisCheckpointSaver(BaseCheckpointSaver[str]):
             pipe.zadd(self._write_task_ids_key(thread, ns, cid), {task_id: 0})
             pipe.sadd(self._namespaces_key(thread), ns)
             pipe.sadd(self._threads_key(), thread)
-            await pipe.execute()
+            # 同 `aput`：节点写通道失败同样只丢"这一轮的可续跑状态"，不该打断回答。
+            try:
+                await pipe.execute()
+            except Exception as exc:
+                logger.error(
+                    "checkpoint writes 写入失败（已降级，本轮不落库）: thread=%s ckpt=%s task=%s err=%s: %s",
+                    thread, cid, task_id, type(exc).__name__, exc,
+                )
 
     # ------------------------------------------------------------------
     # 异步：删除
@@ -422,10 +414,7 @@ class AsyncRedisCheckpointSaver(BaseCheckpointSaver[str]):
     # ------------------------------------------------------------------
     def get_next_version(self, current: str | None, channel: None) -> str:
         """与官方 AsyncSqliteSaver 同一算法：``{递增序号:032}.{随机数:016}``。
-
-        同一次写入内序号相同、随机后缀不同，既保证单调递增又能在同一「版本」内
-        区分先后（LangGraph 的 channel 版本比较依赖这个约定）。
-        """
+        同一次写入内序号相同、随机后缀不同 ⇒ 单调递增且同版本内可区分先后（LangGraph 版本比较依赖此约定）。"""
         if current is None:
             current_v = 0
         elif isinstance(current, int):

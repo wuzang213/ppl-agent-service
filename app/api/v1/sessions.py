@@ -55,12 +55,9 @@ async def remove_session(
     thread_id: str,
     user_info: Optional[str] = Header(default=None, alias="user-info"),
 ):
-    """删除会话及其checkpoint，先清状态再删 DB 行
-
-    区分两种拒绝：会话**不存在** → 404；存在但**不属于当前用户** → 403。
-    （原实现先做归属校验，导致"已删除的会话"被判成 403，下面那句 `not deleted -> 404`
-    永远不可达；现改为先按主键查存在性。）
-    """
+    """删除会话及其 checkpoint，先清状态再删 DB 行。
+    区分两种拒绝：会话**不存在** → 404；存在但**不属于当前用户** → 403（先按主键查存在性，
+    否则"已删除的会话"会被判成 403，下面 `not deleted -> 404` 永远不可达）。"""
     uid = _require_user(user_info)
     session = await get_session(thread_id)
     if session is None:
@@ -90,14 +87,9 @@ async def get_session_messages(
     offset: int = Query(0, ge=0, description="从最新往老跳过的条数，用于翻页"),
     user_info: Optional[str] = Header(default=None, alias="user-info"),
 ):
-    """获取会话的历史消息
-
-    与 DELETE 同样区分：会话不存在 → 404，不属于当前用户 → 403
-    （原实现把两种情况都判成 403，这里一并修正）。
-
-    返回的是 append-only 消息表里的**完整记录**，不受历史压缩影响。
-    `limit`/`offset` 可选；不传时行为与原来完全一致（返回全部）。
-    """
+    """获取会话的历史消息（append-only 消息表里的**完整记录**，不受历史压缩影响）。
+    与 DELETE 同样区分：会话**不存在** → 404，不属于当前用户 → 403。
+    `limit`/`offset` 可选；不传时行为与原来一致（返回全部）。"""
     uid = _require_user(user_info)
     session = await get_session(thread_id)
     if session is None:
