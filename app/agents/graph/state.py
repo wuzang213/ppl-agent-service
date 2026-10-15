@@ -16,14 +16,29 @@ SubIntent = Literal["nearby", "detail", "voucher", "rag", "compare"]
 # 这里不该再有 `WorkerTask`：可执行取数任务只有 `detail` / `voucher` / `rag`（权威定义见
 #    `nodes.SHOP_RECORD_TASKS`，引导意图见 `nodes.BOOTSTRAP_INTENTS`）；`compare` 自 `plans/0009.2`
 #    起已不是 worker 任务（仍是 `SubIntent`）。需要任务集合请直接引用 `nodes` 的常量。
-DependsOn = Literal["price", "score", "distance", "sold"]
+DependsOn = Literal[
+    "price", "score", "distance", "sold",
+    "price_desc", "score_asc", "distance_desc", "sold_asc",
+]
 
 _VALID_SUBINTENTS = {"nearby", "detail", "voucher", "rag", "compare"}
-_VALID_DEPENDS_ON = {"price", "score", "distance", "sold"}
+#: `depends_on` 的合法取值。**维度自带方向**（`price`=最便宜 / `price_desc`=最贵），
+#: 不用独立的 `sort_direction` 字段 —— 后者是"全局一个方向"，多维度复合偏好
+#: （如"评分最高、距离最远"）就表达不了；维度自带方向才可组合（`specs/00xx` 问题 B）。
+_VALID_DEPENDS_ON = {
+    "price", "score", "distance", "sold",
+    "price_desc", "score_asc", "distance_desc", "sold_asc",
+}
+#: 指代下标列表的最大长度。用户说"前 100 家"时不能把下游拉爆；
+#: 与 `_build_schemes` 的每套上限（`AGENT_MULTI_SCHEME_ITEMS` 默认 5）对齐口径。
+MAX_TARGET_INDICES = int(os.getenv("AGENT_MAX_TARGET_INDICES", "5"))
 #: 软偏好（排序）维度的合法取值。与 `depends_on` **共用同一组维度**，但语义不同：
 #: `depends_on` 是"目标定位维度"（唯一、决定"是哪一家"），`preferences` 是"排序偏好"（有序、可多条）。
-#: 二者**不强制一致**（`specs/0024` §8 Q2）。
-_VALID_PREFERENCES = {"price", "score", "distance", "sold"}
+#: 二者**不强制一致**（`specs/0024` §8 Q2）。同样支持反向后缀（`specs/00xx` 问题 B）。
+_VALID_PREFERENCES = {
+    "price", "score", "distance", "sold",
+    "price_desc", "score_asc", "distance_desc", "sold_asc",
+}
 
 
 class PreferenceItem(BaseModel):
@@ -98,8 +113,10 @@ class RoutePlan(BaseModel):
     )
     depends_on: DependsOn | None = Field(
         default=None,
-        description="target_depends_on_result=true 时，依赖的是哪个维度："
-        "price=价格最低；score=评分最高；distance=距离最近；sold=销量最高。"
+        description="target_depends_on_result=true 时，依赖的是哪个维度。"
+        "**维度自带方向**：price=价格最低（最便宜）；score=评分最高；distance=距离最近；sold=销量最高。"
+        "用户要的是**反向**（最贵/最远/评分最低/卖得最少）时用带后缀的取值："
+        "price_desc=最贵；distance_desc=最远；score_asc=评分最低；sold_asc=卖得最少。"
         "为 false 时留空。",
     )
     preferences: list[PreferenceItem] = Field(
@@ -110,6 +127,25 @@ class RoutePlan(BaseModel):
         "⚠️ 与 `depends_on` **独立、不强制一致**：`depends_on` 回答'是哪一家'，"
         "`preferences` 只是'排序倾向'；两者可同时出现，也可不同。",
     )
+    target_indices: list[int] = Field(
+        default_factory=list,
+        description="指代解析出的**跨轮焦点店铺下标**（0 基；`-1` = 倒数第一）。"
+        "「第二家」→[1]；「最后一家」→[-1]；「这三家」→[0,1,2]；「最后两家」→[-2,-1]；"
+        "「前两家」→[0,1]。**家数由列表长度表达**；"
+        "没用到指代、或无法判断指代指向哪几家时**留空数组 []**"
+        "（留空 ⇒ 下游回退正则兜底，绝不因此判失败）。"
+        "⚠️ **只管「指代指向哪几家」，不管「要几家」** —— "
+        "用户说「附近评分最高的两家」时**没有指代**，此处仍应留空，家数填到 `top_n`。",
+    )
+    top_n: int = Field(
+        default=0,
+        description="用户**明确点出的家数**（「两家」「三家」「top3」「前5个」），与指代**完全独立**。"
+        "只在用户说了家数时填写；**没说就留 0**（= 按老路子收窄 1 家，绝不替用户猜家数）。"
+        "⚠️ 与 `target_indices` 的分工："
+        "「**这三家里**评分最高的两家」⇒ 指代说范围（`target_indices=[0,1,2]`）、"
+        "家数说取几个（`top_n=2`），**两个都要填**；"
+        "「**附近**评分最高的两家」⇒ 没有指代（`target_indices=[]`），只有家数（`top_n=2`）。",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -118,7 +154,7 @@ class RoutePlan(BaseModel):
         if not isinstance(data, dict):
             return data
         out = dict(data)
-        for k in ("sub_intents", "shop_names", "shop_types", "shop_terms_raw"):
+        for k in ("sub_intents", "shop_names", "shop_types", "shop_terms_raw", "target_indices"):
             if out.get(k) is None:
                 out[k] = []
         for k in ("shop_type", "shop_type_raw", "clarify_question", "rewritten_query"):
@@ -195,6 +231,50 @@ class RoutePlan(BaseModel):
         if not isinstance(v, str):
             return ""
         return v.strip()
+
+    @field_validator("target_indices", mode="before")
+    @classmethod
+    def _clean_target_indices(cls, v: Any) -> list:
+        """指代下标容错（**入口抽取为主链、正则兜底**，见 `specs/00xx`）：任何异常形态一律退成 `[]`，
+        绝不抛 `ValidationError`（抛了会让整条意图识别作废，退到 `route_degraded` 降级 ——
+        "指代抽不出来"远不该是那条路）。
+        接受的形态：`[1]` / `["1"]` / `[-2, -1]` / `["-1"]`；丢弃非整数项与 `None`；
+        去重保序；截断到 `len(focus)` 无处可知，故只做**数量上限**（`MAX_TARGET_INDICES`，防"前100家"打爆下游）。
+        """
+        if not isinstance(v, list):
+            return []
+        out: list[int] = []
+        for item in v:
+            try:
+                # 布尔是 int 子类，必须排除（True 会变成 1，静默错位）
+                if isinstance(item, bool):
+                    continue
+                idx = int(str(item).strip())
+            except (TypeError, ValueError):
+                continue
+            if idx not in out:
+                out.append(idx)
+        return out[:MAX_TARGET_INDICES]
+
+    @field_validator("top_n", mode="before")
+    @classmethod
+    def _clean_top_n(cls, v: Any) -> int:
+        """家数容错（同 `_clean_target_indices` 口径：**任何异常形态一律退成 `0`**，绝不抛
+        `ValidationError` —— 抛了会让整条意图识别作废、退到 `route_degraded` 降级，
+        而"家数抽不出来"远不该是那条路）。
+        接受 `2` / `"2"` / `" 2 "`；`None` / `""` / 非数字 / 布尔 ⇒ `0`（= 未说家数）；
+        `<1` ⇒ `0`（"0 家""负几家"无意义，视为没说）；
+        上限 `MAX_TARGET_INDICES`（防"前 100 家"拉爆下游查询）。
+        """
+        if v is None or isinstance(v, bool):
+            return 0
+        try:
+            n = int(str(v).strip())
+        except (TypeError, ValueError):
+            return 0
+        if n < 1:
+            return 0
+        return min(n, MAX_TARGET_INDICES)
 
     @model_validator(mode="after")
     @classmethod
@@ -419,7 +499,14 @@ class HmdpState(TypedDict):
     # ---- 第三层：收窄前置的结果（`nearby_worker` 写出，`route_after_fanout` 读）----
     #: 规则收窄成功后**唯一确定**的目标店 id。非空 ⇒ 目标已明确 ⇒ 跳过 `react_loop`
     #: （它的唯一入口理由是"还不知道是哪家"）。收窄失败时保持 `None`，照旧进环兜底。
+    #: 单店收窄时仍会写（向后兼容旧 checkpoint 与既有读侧）；**多店收窄只看下面的 list 字段**。
     narrowed_shop_id: int | None
+
+    #: 收窄前置的多店结果（`specs/00xx` 问题 A）：规则按维度排序取前 `top_k` 家（`top_k` 来自
+    #: 入口的 `target_indices` 长度）。**非空即表示已收窄**（含 `len==1`）；只收窄到 1 家时
+    #: 上一条 `narrowed_shop_id` 也会同写，故读侧优先看本字段、回退旧字段。
+    #: 空列表 ⇒ 未收窄 ⇒ 照旧进 `react_loop` 兜底。
+    narrowed_shop_ids: list[int]
 
     # ---- 第三层：worker 产出（短生命周期，汇总后清空）----
     worker_outputs: Annotated[list[dict], add_and_clear]

@@ -22,6 +22,8 @@ Python、FastAPI、LangChain、LangGraph、Chroma、BM25、RRF、Cross-Encoder�
 
 - **多方案对比**：用户的软偏好含 ≥2 个维度时，按维度各出一套方案（最便宜 / 评分最高 / 离得最近…）随 SSE 下发；只新增字段，原有 `shops` 完整保留，旧前端不受影响。
 
+- **多店定位与反向偏好**：维度自带方向（支持「最贵 / 最远 / 评分最低」等反向说法），收窄不再是「只取一家」——用户说「评分最高的两家」就收窄到两家，指代说范围（「这三家里」）与明说家数（「哪两家」）分开表达、可同时生效。
+
 - **高精度 RAG 问答**：融合向量 + BM25 / ES 稀疏多路检索与 Cross-Encoder 重排（相对阈值动态裁剪），MQ 增量同步知识库，搭建问答评估体系。
 
 - **长会话历史压缩**：按估算 token 预算触发滚动摘要；压缩失败时保留原文、下轮重试，绝不静默丢失已发生的对话。
@@ -103,7 +105,7 @@ flowchart TD
 
 - 常规推荐链路**只调 2 次 LLM**（入口 + 汇总），中间全是数据节点，对比旧版 5–8 次工具循环；
 - 单店 / 多店由 `len(shop_ids)` 推导，它是事实不是意图，不额外占用一次模型调用；
-- `focus_shops` 入 State，解决「这家 / 第二家 / 它」的跨轮指代；
+- `focus_shops` 入 State，解决「这家 / 第二家 / 它 / 最后两家 / 前两家」的跨轮指代：入口模型抽出下标（支持负数倒数、复数区间），抽不到再回退规则兜底；
 - `worker_outputs` 用完即清（可序列化字符串哨兵 `__CLEAR__`），避免被 checkpoint 带入下一轮导致上下文膨胀；
 - 两个 `interrupt()` 点（槽位澄清 / 预约确认）互不重叠，且都只在纯函数之后挂起，保证重放不产生副作用。
 
@@ -198,6 +200,7 @@ agent-service/
 | `AGENT_FANOUT_FAIL_THRESHOLD` / `_COOLDOWN` | `3` / `30` | 熔断阈值与冷却窗口（秒） |
 | `AGENT_MAX_SHOPS` | `3` | 单次并行处理的店铺数上限 |
 | `AGENT_NEARBY_TOP` / `AGENT_NEARBY_MAX_TYPES` | `5` / `3` | 「附近找店」候选数与最多解析的类型数 |
+| `AGENT_MAX_TARGET_INDICES` | `5` | 指代下标与「明说家数」的截断上限（防「前 100 家」拉爆查询） |
 | `AGENT_REACT_MAX_STEPS` | `6` | ReAct 补跳最大步数 |
 | `AGENT_PLAN_ENABLED` | `false` | 行程规划轨总开关（关闭时判据照跑、一律回落 recommend） |
 | `AGENT_MULTI_SCHEME_ENABLED` | `true` | 软偏好多维度时是否出多套方案 |

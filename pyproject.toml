@@ -25,6 +25,7 @@ dependencies = [
     "notebook>=7.6.1",
     "openai>=2.53.0",
     "pydantic>=2.13.4",
+    "pybreaker>=1.2.0",
     "python-dotenv>=1.2.2",
     "sentence-transformers>=5.7.0",
     "torch>=2.13.0",

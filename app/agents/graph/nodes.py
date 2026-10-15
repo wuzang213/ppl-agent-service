@@ -65,7 +65,7 @@ from app.agents.graph.prompts import (
     plan_summary_system,
     summary_system,
 )
-from app.agents.graph.state import CLEAR, HmdpState, RoutePlan, plan_of
+from app.agents.graph.state import CLEAR, MAX_TARGET_INDICES, HmdpState, RoutePlan, plan_of
 from app.agents.graph.token_budget import (
     estimate_messages_tokens,
     estimate_tokens,
@@ -339,25 +339,55 @@ def _split_list_or_error(value: Any) -> tuple[list[Any], str]:
 _ORDINAL = {"一": 0, "二": 1, "两": 1, "三": 2, "四": 3, "五": 4, "1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
 # 单数/复数指代都算"用了指代"。注意要能匹配「这三家」——原来只写了「这两家」，
 # 导致「这三家对比如何」连指代分支都进不去，直接跑到兜底追问。
+# 「最后N家 / 倒数第N家」也要算 —— 否则「那最后一家怎么样」连指代分支都进不来
+# （`最后` 既不在 `这/那` 前缀里，`一家` 又因 `(?<!第)` 之外的原因不被 `第X家` 覆盖）。
 _ANAPHORA = re.compile(
-    r"这家|那家|此店|它|它们|这[一二两三四五1-5][家个]|这几家|"
-    r"第[一二两三四五1-5][家个]|其中|哪个更好|哪家更"
+    r"这家|那家|此店|它|它们|这[一二两三四五1-5][家个]|那[一二两三四五1-5][家个]|这几家|"
+    r"第[一二两三四五1-5][家个]|倒数第[一二两三四五1-5][家个]|"
+    r"最后[这那]?[一二两三四五1-5][家个]|最后[这那]家|"
+    r"前[一二两三四五1-5][家个]|"
+    r"其中|哪个更好|哪家更"
 )
 # 复数指代：这类说法指向多家店，不能只取焦点里的第一家。
-# 必须排除「第X家」——那是单数指代。否则「第二家」里的「二家」会被当成复数，
-# 走到 focus[:2] 去，把单数问题解析成两家。（用 (?<!第) 负向后顾排除）
+#
+# 🔴 两个"别抢单数"的排除（都踩过）：
+# 1. **「第X家」/「倒数第X家」**是单数 ⇒ `(?<!第)` 负向后顾排除（否则「第二家」的「二家」
+#    会被当复数，走 `focus[:2]` 把单数问题解析成两家）。
+# 2. 🔴 **「最后一家」/「最后那家」是单数**，但 `最` 不是 `第` ⇒ `(?<!第)` 拦不住
+#    （旧版这里 `那最后一家` 命中复数分支 → `focus[:1]` → **取到第一家**，
+#    而 `_ordinal_index` 明明会返回 `-1`）。⇒ 再补 `(?<!最后)` 负向后顾。
+#    ⚠️ 只排「最后**一**家」（`(?<!最后)` 只管前两个字），「最后两家」要留给复数分支。
 _PLURAL_ANAPHORA = re.compile(
-    r"(?<!第)[这那]?[一二两三四五1-5][家个]|这[几些]家|这些|它们|都|分别|各自|对比|比较|哪个更好|哪家更"
+    r"(?<!第)(?<!最后)[这那]?[一二两三四五1-5][家个]|"
+    r"最后[这那]?[二两三四五2-5][家个]|"
+    r"这[几些]家|这些|它们|都|分别|各自|对比|比较|哪个更好|哪家更"
 )
 
 
 def _plural_count(query: str) -> int | None:
-    """从「这三家 / 那两家 / 两家」里抽出用户指代的店铺数量（不是索引）：`_ORDINAL` 存的是索引（三→2），所以这里要 +1 才是家数；同样排除「第X家」（`(?<!第)`），避免把「第二家」读成"2 家"。"""
-    match = re.search(r"(?<!第)[这那]?([一二两三四五1-5])[家个]", query)
-    if not match:
-        return None
-    idx = _ORDINAL.get(match.group(1))
-    return None if idx is None else idx + 1
+    """从「这三家 / 那两家 / 两家 / 最后两家」里抽出用户指代的店铺数量（不是索引）：`_ORDINAL` 存的是索引（三→2），所以这里要 +1 才是家数。
+
+    两个排除，与 `_PLURAL_ANAPHORA` 同源：
+    - `(?<!第)`：不把「第二家」读成"2 家"；
+    - `(?<!最后)`：不把「最后**一**家」读成"1 家"（那是单数指代，家数该由 `_ordinal_index` 处理）。
+      ⚠️「最后两家」仍要能读到 2 —— `(?<!最后)` 只看前两字，`两家` 前是「最后」⇒ 也会被排掉，
+      所以「最后N家」由下面第二条分支单独兜。
+    """
+    match = re.search(r"(?<!第)(?<!最后)[这那]?([一二两三四五1-5])[家个]", query)
+    if match:
+        idx = _ORDINAL.get(match.group(1))
+        return None if idx is None else idx + 1
+    # 「最后两家 / 最后三家」：`最后` 后的家数（排除「最后一家」，那是单数）
+    match = re.search(r"最后[这那]?([二两三四五2-5])[家个]", query)
+    if match:
+        idx = _ORDINAL.get(match.group(1))
+        return None if idx is None else idx + 1
+    # 「前两家 / 前三家」：从头部数起（起点固定 0，`_ordinal_index` 对 `前N家` 返回 None）
+    match = re.search(r"前([二两三四五2-5])[家个]", query)
+    if match:
+        idx = _ORDINAL.get(match.group(1))
+        return None if idx is None else idx + 1
+    return None
 
 
 # ---- 通用小工具 -----------------------------------------------------------
@@ -2354,6 +2384,11 @@ _PREFERENCE_LABELS: dict[str, str] = {
     "score": "评分高",
     "distance": "距离近",
     "sold": "销量高",
+    # ---- 反向（`specs/00xx` 问题 B）：软偏好同样可能出现"最贵/最远"这类说法 ----
+    "price_desc": "人均价格高（最贵）",
+    "score_asc": "评分低",
+    "distance_desc": "距离远（最远）",
+    "sold_asc": "销量低",
 }
 
 
@@ -3899,12 +3934,73 @@ async def booking_confirm(state: HmdpState) -> Command[Literal["entry_router", E
 # 第二层：Grounding——把用户的表述解析成 shop_ids
 # ===========================================================================
 def _ordinal_index(query: str) -> int | None:
+    """单数指代的**下标**（与 `_indices_to_ids` 同语义：`-1` = 倒数第一）。
+
+    支持「第N家」（正下标）、「倒数第N家」、「最后一家 / 最后那家」（`-1`）。
+    注意本函数**只负责单数**；「最后两家」是复数，家数/区间由 `_plural_count` + 这里返回的
+    **起点下标**共同表达（见 `grounding` 里 `_plural_span`）。
+    """
     match = re.search(r"第([一二两三四五1-5])家", query)
     if match:
-        return _ORDINAL.get(match.group(1))
-    if "最后一家" in query or "最后那家" in query:
+        pos = _ORDINAL.get(match.group(1))
+        if pos is None:
+            return None
+        # 「倒数第N家」⇒ 负数下标（Python 语义：-1 是最后一家）
+        if re.search(r"倒数第" + re.escape(match.group(1)) + r"家", query):
+            return -(pos + 1)
+        return pos
+    if "最后一家" in query or "最后那家" in query or "最后这家" in query:
         return -1
+    # 「最后两家 / 最后三家」⇒ 区间起点（负数），家数由 `_plural_count` 给
+    match = re.search(r"最后[这那]?([二两三四五2-5])[家个]", query)
+    if match:
+        idx = _ORDINAL.get(match.group(1))
+        return None if idx is None else -(idx + 1)
     return None
+
+
+def _span_by_start_count(start: int, count: int, total: int) -> list[int]:
+    """把「起点下标 + 家数」折成**绝对下标列表**（`grounding` 正则兜底用）。
+
+    - **负起点**：`start=-2, count=2, total=3` ⇒ `[-2,-1]` ⇒ `[1,2]`（最后两家）。
+    - **越界裁剪**：`total=3, start=1, count=5` ⇒ `[1,2]`（能给几家给几家，不报错）。
+    - 家数 ≤ 0 或 `total` ≤ 0 ⇒ `[]`（调用方会退化到"取焦点第一家"以外的兜底路径）。
+    """
+    if total <= 0 or count <= 0:
+        return []
+    begin = start + total if start < 0 else start
+    begin = max(0, min(begin, total - 1))
+    return list(range(begin, min(begin + count, total)))
+
+
+def _indices_to_ids(indices: Any, focus: list[dict]) -> list[int]:
+    """把入口抽出的**指代下标**翻译成 focus 里的店 id（`specs/00xx`）。
+    - **负索引**：`-1` = 倒数第一（Python 语义，与 `_ordinal_index` 的 `-1` 一致），`-2` = 倒数第二；
+      「最后两家」⇒ `[-2, -1]` ⇒ 天然取到末尾两家，无需单独表达"反向区间"。
+    - **越界丢弃**：`focus` 只有 3 家而模型给了 `[0,1,5]` ⇒ 丢掉 5（**不报错、不回退全量**，
+      能解析几家就几家；全越界 ⇒ 返回 `[]` ⇒ 调用方回退正则兜底）。
+    - **去重保序**：重复下标（模型有时会重复输出）只保留首次出现。
+    - 非 `int` 项丢弃（validator 已清洗过一轮，这里是**双保险**：本函数也可能被别的路径直接调）。
+    :returns: 店 id 列表；无有效项返回 `[]`。
+    """
+    out: list[int] = []
+    seen: set[int] = set()
+    total = len(focus)
+    for raw in indices or []:
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            continue
+        idx = raw + total if raw < 0 else raw      # 负索引归一成绝对下标
+        if idx < 0 or idx >= total:
+            continue                                # 越界丢弃
+        shop = focus[idx]
+        sid = shop.get("id") if isinstance(shop, dict) else None
+        if sid is None:
+            continue
+        sid = int(sid)
+        if sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+    return out
 
 
 # ---- 「按店名反查」的三种结局 ----
@@ -3984,19 +4080,36 @@ async def grounding(state: HmdpState) -> dict:
     names = [n for n in (plan.shop_names or []) if n]
 
     # 1) 指代消解：这家 / 第二家 / 这三家 —— 依赖跨轮焦点，这是 focus_shops 必须入 State 的原因
-    if not names and _ANAPHORA.search(query) and focus:
-        if _PLURAL_ANAPHORA.search(query):
-            # 优先按用户明说的家数取（"这三家" → 3），否则按"两家"或上限兜底
-            limit = _plural_count(query) or (2 if re.search(r"两[家个]", query) else MAX_SHOPS)
-            ids.extend(int(s["id"]) for s in focus[:limit] if s.get("id") is not None)
+    #    **入口抽取为主链**（`specs/00xx`）：入口模型已把 `target_indices` 抽出来（0 基、-1=倒数第一），
+    #    这里直接用 ⇒ 「最后两家」「前两家」这类正则表达不了的说法也能解析。
+    #    抽不到（`[]`）才走下面的正则兜底 —— 正则**不是**主路径，只是"模型没抽/抽不动"时的保险，
+    #    这样"指代解析失败"永远不会把整轮打崩（最差退化成旧行为）。
+    if not names and focus and plan.target_indices:
+        picked_ids = _indices_to_ids(plan.target_indices, focus)
+        if picked_ids:
+            ids.extend(picked_ids)
+            logger.info("指代消解（入口抽取）：indices=%s → shop_ids=%s",
+                        list(plan.target_indices), picked_ids)
+
+    # 1b) 兜底：入口没抽到指代 ⇒ 走正则（旧逻辑，仅"单数/复数二选一"的判据被修，见下）
+    if not ids and not names and _ANAPHORA.search(query) and focus:
+        # 🔴 判据顺序：**先问"是不是单数序号"，再问"是不是复数"**。
+        #    旧版先判 `_PLURAL_ANAPHORA`，而「最后一家」里的 `一家` 会被复数正则吃到
+        #    （`(?<!第)` 拦不住，因为前面是 `最` 不是 `第`）⇒ 走到 `focus[:1]` ⇒
+        #    「那最后一家怎么样」取到**第一家**，而 `_ordinal_index` 明明会返回 `-1`。
+        #    现在单数序号有值就不进复数分支，语义不会两头抢。
+        idx = _ordinal_index(query)
+        count = _plural_count(query)
+        if count is not None and count > 1:
+            # 复数：家数由 `count` 表达，起点由 `idx` 表达（`最后两家` ⇒ idx=-2, count=2）
+            start = idx if idx is not None else 0
+            span = _span_by_start_count(start, count, len(focus))
+            ids.extend(int(focus[i]["id"]) for i in span if focus[i].get("id") is not None)
         else:
-            idx = _ordinal_index(query)
             if idx is None:
                 pick = focus[0]
-            elif idx == -1:
-                pick = focus[-1]
             else:
-                pick = focus[idx] if idx < len(focus) else focus[0]
+                pick = focus[idx] if -len(focus) <= idx < len(focus) else focus[0]
             ids.append(int(pick["id"]))
 
     # 2) query 里直接出现了焦点店铺名
@@ -4313,21 +4426,27 @@ def _nearby_business_empty(type_name: str) -> tuple[str, ...]:
     )
 
 
-def _narrow_candidates_by_plan(plan: "RoutePlan | None", shops: list) -> int | None:
+def _narrow_candidates_by_plan(plan: "RoutePlan | None", shops: list) -> list[int]:
     """收窄前置：用候选里已经带全的 4 个维度，在发 Send 之前把目标店定下来。
     否则第 2 批的消费类 Send 已在 `route_after_nearby` 按候选全集发出、收窄只发生在 `react_loop` 内 ⇒"附近最便宜的那家有什么券"会先给 3 家候选各取一次券、进环后又给那家再取一次（共 4 次，3 次白取）；而收窄要的 `avgPrice` / `score` / `distance` / `sold` 在 nearby 候选里早已带全。
-    判据保守（R6）：只在"候选 >1 且该维度有取值 且 结果唯一"时收窄；维度非法 / 全部缺值 / 结果不唯一 ⇒ 返回 `None`，行为与阶段一完全一致（进环兜底）。"""
+    判据保守（R6）：只在"候选 >1 且该维度有取值 且 结果条数 == 请求的 `top_k`"时收窄；维度非法 / 全部缺值 / 候选池不足 ⇒ 返回 `[]`，行为与阶段一完全一致（进环兜底）。
+    `specs/00xx`：`top_k` 来自 `plan_top_k`（用户明说的 `top_n` 优先，其次指代 `target_indices` 的长度），
+    支持"评分最高的两家"这类多店需求 —— **含没有指代、只说家数**的问句（`plans/0050` 缺口 b）。
+    :returns: 收窄后的店 id 列表（**保序**）；未收窄返回 `[]`。
+    """
     if not plan or not plan.target_depends_on_result:
-        return None
+        return []
     candidates = [s for s in (shops or []) if isinstance(s, dict) and _shop_id_of(s) is not None]
     if len(candidates) <= 1:
-        return None
-    # `_narrow_by_dimensions` 在"全部维度都缺值 / 维度非法"时**原样返回** ⇒ 长度不为 1，
-    # 于是这里天然不会臆造排序（与 `react_loop` 里那道收窄共用同一个算法与同一份维度判据）。
-    top = _narrow_by_dimensions(candidates, _plan_ranking_dimensions(plan))
-    if len(top) != 1:
-        return None
-    return _shop_id_of(top[0])
+        return []
+    top_k = plan_top_k(plan)
+    # `_narrow_by_dimensions` 在"全部维度都缺值 / 维度非法"时**原样返回** ⇒ 长度不等于请求的
+    # `top_k`（除非候选恰好就这么多），于是这里天然不会臆造排序（与 `react_loop` 里那道收窄
+    # 共用同一个算法与同一份维度判据）。
+    top = _narrow_by_dimensions(candidates, _plan_ranking_dimensions(plan), top_k)
+    if len(top) != top_k:
+        return []
+    return [sid for sid in (_shop_id_of(s) for s in top) if sid is not None]
 
 
 def _max_nearby_types() -> int:
@@ -4586,14 +4705,14 @@ async def _nearby_for_target(
     focus = [item for item in (_to_focus_item(s) for s in picked) if item is not None]
     candidate_ids = [_shop_id_of(s) for s in picked if _shop_id_of(s) is not None]
 
-    # 收窄前置（plans/0009.2 N7 / 决策 1-B）：目标店在发 Send 之前定下来时，`shop_ids` 直接收窄为那一家 ⇒ 第 2 批只给这一家取数，并把 `narrowed_shop_id` 写给 `route_after_fanout` 让它跳过整轮 ReAct。
+    # 收窄前置（plans/0009.2 N7 / 决策 1-B；多店见 `specs/00xx`）：目标店在发 Send 之前定下来时，`shop_ids` 直接收窄为那几家 ⇒ 第 2 批只给这几家取数，并把 `narrowed_shop_ids` 写给 `route_after_fanout` 让它跳过整轮 ReAct。
     # 完整候选仍留在 `items` 里（`focus_shops` 也照旧全量沉淀），渲染与跨轮焦点不受影响。
     narrowed = _narrow_candidates_by_plan(plan, picked)
     logger.info("附近找店：raw=%s type=%s 命中 %s 家%s", raw_type or "-", type_name, len(picked),
-                f"，按 {plan.depends_on} 收窄到 {narrowed}" if narrowed is not None else "")
+                f"，按 {plan.depends_on or plan.preferences} 收窄到 {narrowed}" if narrowed else "")
 
     result: dict[str, Any] = {
-        "shop_ids": [narrowed] if narrowed is not None else candidate_ids,
+        "shop_ids": narrowed or candidate_ids,
         "focus_shops": focus,
         # 供下一轮的「还有吗」复用（那句本身不含品类词）
         "last_nearby_type": type_name,
@@ -4613,8 +4732,13 @@ async def _nearby_for_target(
             }
         ],
     }
-    if narrowed is not None:
-        result["narrowed_shop_id"] = narrowed
+    if narrowed:
+        # 多店收窄（`specs/00xx`）：`narrowed_shop_ids` 是**新的权威字段**；
+        #   单店时**同时**写老字段 `narrowed_shop_id`，保证既有读侧（`route_after_fanout` /
+        #   `react_loop` 守卫二 / 旧 checkpoint）逐字节不变。
+        result["narrowed_shop_ids"] = narrowed
+        if len(narrowed) == 1:
+            result["narrowed_shop_id"] = narrowed[0]
     return result
 
 
@@ -5018,6 +5142,11 @@ _DEPENDS_ON_HINTS: dict[str, str] = {
     "score": "评分最高（字段 score，越大越优）",
     "distance": "距离最近（字段 distance，越小越优）",
     "sold": "销量最高（字段 sold，越大越优）",
+    # ---- 反向 ----
+    "price_desc": "人均价格最高（最贵；字段 avgPrice，越大越优）",
+    "score_asc": "评分最低（字段 score，越小越优）",
+    "distance_desc": "距离最远（字段 distance，越大越优）",
+    "sold_asc": "销量最低（字段 sold，越小越优）",
 }
 
 
@@ -5091,12 +5220,23 @@ def route_after_nearby(state: HmdpState) -> list[Send] | str:
 # ---------------------------------------------------------------------------
 # ReAct 补跳（specs/0005 §5.5.4）——接在固定编排**之后**
 # ---------------------------------------------------------------------------
+def _narrowed_ids(state: Any) -> list[int]:
+    """已收窄到的店 id 列表（`specs/00xx`）：优先新字段 `narrowed_shop_ids`，为空时回退旧 `narrowed_shop_id`。
+    **必须两字段都认**：旧 checkpoint 里只有单值字段，只看新字段会把"已收窄"误判成"未收窄"
+    ⇒ 白进一轮 ReAct（真机会多烧 ≤6 次模型调用）。"""
+    ids = [i for i in (state.get("narrowed_shop_ids") or []) if isinstance(i, int)]
+    if ids:
+        return ids
+    single = state.get("narrowed_shop_id")
+    return [single] if isinstance(single, int) else []
+
+
 def route_after_fanout(state: HmdpState) -> str:
     """固定编排（第 1 批）之后的去向：目标依赖中间结果（`plan.target_depends_on_result`）就去补跳，否则直接汇总。
     判据来自入口模型的语义，这里只做结构判断（布尔 → 走哪条边）；这是"要不要进环"的唯一入口，`react_loop` 内还有一道守卫双保险。
-    收窄前置（`plans/0009.2` N7 / 决策 1-B）：`narrowed_shop_id` 非空时 ReAct 的唯一入口理由（"还不知道是哪家"）消失 ⇒ 直接汇总，省掉整轮（≤`REACT_MAX_STEPS`）模型调用与重复取数；收窄失败仍照旧进环兜底（R6）。"""
+    收窄前置（`plans/0009.2` N7 / 决策 1-B）：已收窄时 ReAct 的唯一入口理由（"还不知道是哪家"）消失 ⇒ 直接汇总，省掉整轮（≤`REACT_MAX_STEPS`）模型调用与重复取数；收窄失败仍照旧进环兜底（R6）。"""
     plan = plan_of(state)
-    if plan and plan.target_depends_on_result and not state.get("narrowed_shop_id"):
+    if plan and plan.target_depends_on_result and not _narrowed_ids(state):
         return "react_loop"
     return SUMMARY_NODE
 
@@ -5169,11 +5309,29 @@ def _react_prompt_candidates(records: list[dict]) -> list[dict]:
 
 
 #: 维度 → (候选记录里的字段名, 是否"越大越优")。方向必须与 `_DEPENDS_ON_HINTS` 的文字描述一致。
+#: 🔴 **维度自带方向**：`price_desc` / `score_asc` / `distance_desc` / `sold_asc` 是**反向**取值
+#: （最贵 / 评分最低 / 最远 / 卖得最少），与基维度共用同一字段、翻转 `reverse` 即可 —— 这样
+#: "最贵"不会再被收窄成最便宜，也不必新引入 `sort_direction` 全局方向字段（多维度复合偏好时
+#: 单一方向表达不了，见 `specs/00xx` 问题 B）。
 _DEPENDS_ON_FIELDS: dict[str, tuple[str, bool]] = {
     "price": ("avgPrice", False),
     "score": ("score", True),
     "distance": ("distance", False),
     "sold": ("sold", True),
+    # ---- 反向（用户要的是另一头）----
+    "price_desc": ("avgPrice", True),        # 最贵
+    "score_asc": ("score", False),           # 评分最低
+    "distance_desc": ("distance", True),     # 最远
+    "sold_asc": ("sold", False),             # 卖得最少
+}
+
+#: 反向维度 → 基维度（反向只是基维度翻转方向，排序字段不变）。
+#: 用于"同一维度出现正反两种说法 ⇒ 矛盾，视为无效"以及提示词人话渲染。
+_REVERSE_DIMENSIONS: dict[str, str] = {
+    "price_desc": "price",
+    "score_asc": "score",
+    "distance_desc": "distance",
+    "sold_asc": "sold",
 }
 
 
@@ -5186,6 +5344,33 @@ def _plan_ranking_dimensions(plan: "RoutePlan | None") -> list[str]:
     if dims:
         return dims
     return _preference_dimensions([plan.depends_on])
+
+
+def plan_top_k(plan: "RoutePlan | None") -> int:
+    """本次收窄**要几家**（`specs/00xx` 问题 A）。判据**三级**，越靠前越优先：
+
+    1. `top_n` —— 用户**明说的家数**（「评分最高的两家」⇒ 2）。与指代无关，
+       「附近评分最高的两家」这类**没有指代**的问句正是靠它拿到 `top_k=2`（`plans/0050` 缺口 b）。
+    2. `len(target_indices)` —— **指代本身带出的家数**（「最后两家」⇒ `[-2,-1]` ⇒ 2）。
+       用于入口把家数写进了下标列表、没写 `top_n` 的旧行为 / 旧 checkpoint。
+    3. 都为空 ⇒ 回退 `1`，**行为与改造前逐字节一致**（"入口抽取为主链、正则/单店为兜底"的落点：
+       抽不出来就按老路子走）。
+
+    三者都截断到 `MAX_TARGET_INDICES`，防"前 100 家"拉爆查询。
+
+    ⚠️ **为什么 `top_n` 优先于 `target_indices` 长度**：「这三家里评分最高的两家」是
+    指代（范围 3 家）与家数（取 2 家）**同时出现**的形态，此时列表长度 3 表达的是"范围"
+    而不是"要几家"—— 拿长度当 `top_k` 会收窄到 3 家，与用户要的 2 家不符。
+    """
+    if plan is None:
+        return 1
+    n = int(getattr(plan, "top_n", 0) or 0)
+    if n > 0:
+        return min(n, MAX_TARGET_INDICES)
+    n = len([i for i in (plan.target_indices or []) if isinstance(i, int)])
+    if n <= 0:
+        return 1
+    return min(n, MAX_TARGET_INDICES)
 
 
 def _sorted_by_dimensions(candidates: list[dict], dimensions: Any) -> list[dict] | None:
@@ -5220,13 +5405,16 @@ def _sorted_by_dimensions(candidates: list[dict], dimensions: Any) -> list[dict]
     return sorted(candidates, key=_key)
 
 
-def _narrow_by_dimensions(candidates: list[dict], dimensions: Any) -> list[dict]:
-    """按**有序维度列表**把候选收窄到 1 家（`specs/0024` §2 目标 2 / `plans/0043`）；**单维度**同旧 `_narrow_by_depends_on`（`price`→`avgPrice` 最小、`score` 最大、`distance` 最小、`sold` 最大），**多维度**按先后做**字典序**（刻意不用数值权重，量纲不同难解释难测）。
-    **缺字段候选排最后**（绝不当 0 误胜）；维度非法/空/**所有维度全缺值** ⇒ **原样返回**。:returns: 排序后**前 1 条**（`[best]`）；不可算返回**原样全量**（调用方按 `len != 1` 判定）。"""
+def _narrow_by_dimensions(candidates: list[dict], dimensions: Any, top_k: int = 1) -> list[dict]:
+    """按**有序维度列表**把候选收窄到 `top_k` 家（`specs/0024` §2 目标 2 / `plans/0043` / `specs/00xx` 问题 A）；**单维度**同旧 `_narrow_by_depends_on`（`price`→`avgPrice` 最小、`score` 最大、`distance` 最小、`sold` 最大），**多维度**按先后做**字典序**（刻意不用数值权重，量纲不同难解释难测）。
+    **缺字段候选排最后**（绝不当 0 误胜）；维度非法/空/**所有维度全缺值** ⇒ **原样返回**。
+    :param top_k: 要收窄到几家；`<=1` 等价旧行为（返回 `[best]`）。`top_k > 候选数` 时**返回全部候选**（候选池不足不报错）。
+    :returns: 排序后**前 `min(top_k, len)` 条**；不可算返回**原样全量**（调用方按 `len(top_k)` 判定是否收窄成功）。
+    """
     ordered = _sorted_by_dimensions(candidates, dimensions)
     if ordered is None:
         return list(candidates)
-    return [ordered[0]]
+    return ordered[: max(1, int(top_k))]
 
 
 #: 多方案（`specs/0027`）：维度 → 用户向**方案名**。与 `_PREFERENCE_LABELS` 同源集中定义（单一来源）。
@@ -5529,8 +5717,8 @@ async def react_loop(state: HmdpState) -> dict:
     if not plan or not plan.target_depends_on_result:
         # 守卫：无依赖 → 什么都不做（验收 5.3）
         return {}
-    if state.get("narrowed_shop_id"):
-        # 守卫：目标已被规则收窄确定 → 补跳无事可做（决策 1-B）
+    if _narrowed_ids(state):
+        # 守卫：目标已被规则收窄确定（单店或多店都算确定）→ 补跳无事可做（决策 1-B / `specs/00xx`）
         return {}
 
     record_node("react_loop")
@@ -5538,8 +5726,10 @@ async def react_loop(state: HmdpState) -> dict:
     outputs = list(state.get("worker_outputs") or [])
     candidates = _react_candidates(outputs)
 
-    # 规则侧先做一次结构性收窄：按偏好（或回退 depends_on）的有序维度取 Top-1
-    narrowed = _narrow_by_dimensions(candidates, _plan_ranking_dimensions(plan))
+    # 规则侧先做一次结构性收窄：按偏好（或回退 depends_on）的有序维度取 Top-`top_k`
+    # （`specs/00xx`：`top_k` 来自 `plan_top_k` —— 用户明说的 `top_n` 优先、其次指代下标长度，
+    #   都缺省 1 ⇒ 与改造前逐字节一致）
+    narrowed = _narrow_by_dimensions(candidates, _plan_ranking_dimensions(plan), plan_top_k(plan))
 
     produced: list[dict] = []
     history: list[dict] = []
@@ -5944,6 +6134,7 @@ def _terminal_cleanup(state: HmdpState, recommended: list[dict] | None = None) -
         "worker_shop_ids": [],
         "worker_query": "",
         "narrowed_shop_id": None,
+        "narrowed_shop_ids": [],
     }
 
 
